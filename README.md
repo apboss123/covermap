@@ -26,7 +26,7 @@ Outputs: **HTML** (interactive, per-endpoint Mermaid mindmaps), **JSON** (feed t
 ## Install
 
 1. Burp Suite - **Settings - Extensions - Python environment** - set **Jython 2.7 standalone JAR** ([download](https://www.jython.org/download)).
-2. **Extensions - Installed - Add** - Extension type **Python** → select `covermap_burp.py`.
+2. **Extensions - Installed - Add** - Extension type **Python** - select `covermap_burp.py`.
 3. A new **CoverMap** tab appears.
 
 ---
