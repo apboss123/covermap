@@ -100,6 +100,10 @@ Most coverage gaps die in the diff between "I clicked around" and "I actually fu
 
 MIT — see [LICENSE](LICENSE).
 
+##
+
+Aditya Patil (https://www.linkedin.com/in/aditya-patil-109690157/), (https://x.com/AadityaPatil_)
+
 ## Disclaimer
 
 For authorized security testing only. You are responsible for ensuring you have permission to test the target. The author is not liable for misuse.
