@@ -68,13 +68,8 @@ Outputs: **HTML** (interactive, per-endpoint Mermaid mindmaps), **JSON** (feed t
 
 ## Screenshots
 
-_(Drop screenshots into a `screenshots/` folder and reference them here.)_
+<img width="959" height="422" alt="tab" src="https://github.com/user-attachments/assets/5e6433db-07e6-4423-858b-947eb6c6604e" />
 
-```
-![CoverMap tab inside Burp](https://github.com/apboss123/covermap/blob/main/screenshots/tab.png)
-```
-
----
 
 ## How the score works
 
