@@ -1,6 +1,6 @@
-# CoverMap — Burp Suite Extension
+# CoverMap: Burp Suite Extension
 
-**Pentest coverage mapper for Burp Suite.** Ingests your Burp Logger CSV (or Logger++ JSON) export and tells you what you actually tested vs. the untested OWASP Top 10 attack surface — straight from inside Burp.
+**Pentest coverage mapper for Burp Suite.** It ingests your Burp Logger CSV (or Logger++ JSON) export and tells you what you actually tested vs. the untested OWASP Top 10 attack surface: straight from inside Burp.
 
 Self-contained Jython 2.7 extension. No Python 3 install required.
 
@@ -26,8 +26,8 @@ Outputs: **HTML** (interactive, per-endpoint Mermaid mindmaps), **JSON** (feed t
 
 ## Install
 
-1. Burp Suite → **Settings → Extensions → Python environment** → set **Jython 2.7 standalone JAR** ([download](https://www.jython.org/download)).
-2. **Extensions → Installed → Add** → Extension type **Python** → select `covermap_burp.py`.
+1. Burp Suite - **Settings - Extensions - Python environment** - set **Jython 2.7 standalone JAR** ([download](https://www.jython.org/download)).
+2. **Extensions - Installed - Add** - Extension type **Python** → select `covermap_burp.py`.
 3. A new **CoverMap** tab appears.
 
 ---
@@ -35,16 +35,16 @@ Outputs: **HTML** (interactive, per-endpoint Mermaid mindmaps), **JSON** (feed t
 ## Use
 
 1. Export your testing history:
-   - Burp → **Logger** → right-click history → **Save all** → CSV (default), **or**
-   - [Logger++](https://portswigger.net/bappstore/470b7057b86f41c396a97903377f3d81) → **Export** → JSON.
+   - Burp = **Logger** - right-click history - **Save all** - CSV (default), **or**
+   - [Logger++](https://portswigger.net/bappstore/470b7057b86f41c396a97903377f3d81)  **Export** - JSON.
 2. In the CoverMap tab:
-   - **Scope (hosts)** — comma-separated, e.g. `app.target.com,*.target.com`. Filters requests **and** names the output dir.
-   - **Engagement name** — appears in the report header.
-   - **Output base dir** — Browse to pick.
+   - **Scope (hosts)** - comma-separated, e.g. `app.target.com,*.target.com`. Filters requests **and** names the output dir.
+   - **Engagement name** - appears in the report header.
+   - **Output base dir** - Browse to pick.
    - Pick **HTML / JSON / TXT / Markdown** formats.
    - **Upload CSV** and/or **Upload JSON** (multi-select supported; mix freely).
    - **Run Analysis**.
-3. Reports land in `<base>/<scope>_coverage_<timestamp>/` — click **Open output folder**.
+3. Reports land in `<base>/<scope>_coverage_<timestamp>/` - click **Open output folder**.
 
 ---
 
