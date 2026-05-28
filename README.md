@@ -78,9 +78,9 @@ Outputs: **HTML** (interactive, per-endpoint Mermaid mindmaps), **JSON** (feed t
 
 Coverage starts at 100 and is reduced by:
 
-- **Behavior penalty** — single-hit endpoints lose 60, browsed endpoints lose 30, repeater 0, intruder 5.
-- **Real coverage gaps** (auth-removal never tried, methods never tested, no response variance, etc.) — weighted by severity.
-- **Recommended attack tests** — capped aggregate penalty so scores stay comparable.
+- **Behavior penalty**: single-hit endpoints lose 60, browsed endpoints lose 30, repeater 0, intruder 5.
+- **Real coverage gaps** (auth-removal never tried, methods never tested, no response variance, etc.) : weighted by severity.
+- **Recommended attack tests** : capped aggregate penalty so scores stay comparable.
 
 Bands: `0–19 NO COVERAGE` · `20–39 POOR` · `40–59 PARTIAL` · `60–79 MODERATE` · `80–94 ADEQUATE` · `95–100 THOROUGH`.
 
@@ -88,7 +88,7 @@ Bands: `0–19 NO COVERAGE` · `20–39 POOR` · `40–59 PARTIAL` · `60–79 M
 
 ## Why
 
-Most coverage gaps die in the diff between "I clicked around" and "I actually fuzzed every parameter for every class." This extension makes the gap obvious — and points at exactly which payloads to send next.
+Most coverage gaps die in the diff between "I clicked around" and "I actually fuzzed every parameter for every class." This extension makes the gap obvious: and points at exactly which payloads to send next.
 
 ---
 
