@@ -72,7 +72,7 @@ _(Drop screenshots into a `screenshots/` folder and reference them here.)_
 
 ```
 ![CoverMap tab](screenshots/tab.png)
-![HTML report](screenshots/report.png)
+
 ```
 
 ---
