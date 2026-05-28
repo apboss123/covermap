@@ -68,8 +68,7 @@ Outputs: **HTML** (interactive, per-endpoint Mermaid mindmaps), **JSON** (feed t
 
 ## Screenshots
 
-<img width="959" height="422" alt="tab" src="https://github.com/user-attachments/assets/5e6433db-07e6-4423-858b-947eb6c6604e" />
-
+<img width="959" height="505" alt="tab" src="https://github.com/user-attachments/assets/16da4235-50df-4222-a8de-bb0203eafbf8" />
 
 ## How the score works
 
