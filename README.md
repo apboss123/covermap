@@ -94,7 +94,7 @@ Most coverage gaps die in the diff between "I clicked around" and "I actually fu
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT : see [LICENSE](LICENSE).
 
 ##
 
