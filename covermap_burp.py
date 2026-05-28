@@ -166,6 +166,54 @@ WAF_BYPASS = ("WAF bypass: inline comments /*!50000UNION*/, case-toggle uNiOn, "
               "URL/double-URL/unicode/overlong-UTF8 encoding, HTTP param pollution (id=1&id=2), "
               "newline %0a/%0d split, NBSP/zero-width chars, JSON vs form content-type swap, chunked body.")
 
+# Structural parameter-tampering primitives (param removal / empty value / null /
+# type confusion / array bind / HPP). These are NOT payload-injection cases;
+# they cover "what if the server treats missing/empty/wrong-type as success?".
+STRUCTURAL_LOGIN = (
+    "Remove `password` field entirely from the request (some backends short-circuit when missing). "
+    "Send `password=` (present but empty). JSON `\"password\":null`. Type confusion `\"password\":true`. "
+    "Array bind `password[]=` or JSON `\"password\":[]`. Object bind `\"password\":{}`. "
+    "Same set against `username`. HPP: `username=admin&username=guest`. "
+    "Strip cookie-based CSRF token. Drop the Content-Length and re-send. Submit credentials as JSON to a "
+    "form-only endpoint (and vice versa). Try second-factor params blank (`otp=`, `code=`)."
+)
+STRUCTURAL_RESET = (
+    "Remove `token`/`code` parameter entirely. Send empty value. Send `token=null`, `token=true`, `token=[]`. "
+    "Remove `email`/`username` to see if the reset proceeds anonymously. "
+    "Submit reset for target's email with a missing or empty token. "
+    "Submit your own valid token against the victim's email (token-vs-email decoupling). "
+    "Replay the password-set step without first hitting the verify step (skip the state machine)."
+)
+STRUCTURAL_OTP = (
+    "Remove `code`/`otp` parameter entirely. Send empty (`otp=`). Send `otp=null`, `otp=true`, `otp=0`, `otp=[]`. "
+    "Object form `\"otp\":{\"$ne\":null}` (NoSQL). Submit alongside `backup_code=` blank. "
+    "Re-submit the previous successful verify body verbatim (replay). "
+    "Race the verify endpoint with 20-50 parallel requests using one valid code (counter race). "
+    "Skip the verify step entirely and hit the post-verify route directly."
+)
+STRUCTURAL_REGISTER = (
+    "Remove `password`/`email`/captcha-token. Send empty. Array variants (`email[]=a&email[]=b`). "
+    "Inject privilege fields the form does not show: `role=admin`, `is_admin=true`, `verified=true`, "
+    "`email_verified=true`, `tier=premium`, `balance=999999`. "
+    "Register an existing email with a blank password (account-overwrite takeover). "
+    "Skip the email-verification step by hitting the post-verify endpoint directly."
+)
+STRUCTURAL_PRICE = (
+    "Remove `price`/`amount`/`total` parameter entirely (server may fall through to a 0 default). "
+    "Send empty (`amount=`). Send `amount=null`. Negative (`amount=-1`, `qty=-1`). Zero. "
+    "Decimal underflow (`0.001`, `0.0001`). Huge int / scientific (`1e308`, `99999999999`). "
+    "Array (`amount[]=1&amount[]=99999`) - last vs first wins. "
+    "Currency confusion: swap currency code to a lower-value currency keeping the numeric amount. "
+    "Coupon stacking: apply the same one-time coupon in 20 parallel requests. "
+    "Refund/withdraw race: fire the same action concurrently to double-spend."
+)
+STRUCTURAL_LOGOUT = (
+    "Re-use the session cookie immediately after logout (server-side invalidation check). "
+    "Logout via GET if only POST is exposed (CSRF). "
+    "Verify session ID rotates on login (fixation). "
+    "Test logout with a different user's cookie (cross-session logout / DoS)."
+)
+
 SCORE_BANDS = [
     (range(0, 20),   'NO COVERAGE'),
     (range(20, 40),  'POOR'),
@@ -574,6 +622,109 @@ def _infer_fn(path):
     return tags
 
 
+def _response_flip_targets(p, fn):
+    """Build a CONCRETE list of response fields/statuses worth flipping on THIS endpoint.
+    Driven by the path's inferred function, observed status codes, and observed
+    parameter names - so the recommendation names actual likely fields, not generic
+    'flip success:false to true' boilerplate."""
+    targets = []
+    all_param_names = set(str(k).lower() for k in p.query_params)
+    all_param_names |= set(str(k).lower() for k in p.body_params)
+    path_l = p.path.lower()
+
+    # Auth-class endpoints (login, oauth, sso, token)
+    if 'auth' in fn or any(tok in path_l for tok in ('login', 'signin', 'logon', 'authenticate', 'sso', 'oauth')):
+        targets += [
+            '"success":false -> true',
+            '"authenticated":false -> true',
+            '"isLoggedIn":false / "loggedIn":false -> true',
+            '"error":"<msg>" -> "" (empty)',
+            '"errorCode":<n> -> 0',
+            '"twoFactorRequired":true / "mfaRequired":true -> false',
+            '"requiresChallenge":true -> false',
+        ]
+    # Password reset flows
+    if 'reset' in fn:
+        targets += [
+            '"tokenValid":false -> true',
+            '"resetAllowed":false -> true',
+            '"emailSent":false -> true (to confirm enum)',
+            '"step":"verify" -> "complete"',
+        ]
+    # OTP / 2FA / verification
+    if 'otp' in fn:
+        targets += [
+            '"verified":false -> true',
+            '"otpValid":false / "codeValid":false -> true',
+            '"requiresOtp":true / "mfaRequired":true -> false',
+            '"attemptsRemaining":0 -> 999',
+        ]
+    # Admin / privileged surface
+    if 'admin' in fn or any('admin' in n for n in all_param_names):
+        targets += [
+            '"isAdmin":false -> true',
+            '"role":"user" -> "admin" (also "guest"/"member" -> "admin")',
+            '"permissions":[] -> ["*"] (or known permission strings)',
+            '"accessLevel":1 -> 99',
+        ]
+    # Registration
+    if 'register' in fn:
+        targets += [
+            '"emailVerified":false -> true',
+            '"accountCreated":false -> true',
+            '"requiresVerification":true -> false',
+        ]
+    # Status-code flips (driven by what was actually observed)
+    statuses = set(p.status_codes_seen)
+    if 401 in statuses or 403 in statuses:
+        targets.append('HTTP 401/403 -> 200 (response-body of an authorized request substituted in)')
+    if 302 in statuses:
+        targets.append('HTTP 302 redirect -> 200 with the gated body inlined')
+    if 400 in statuses or 422 in statuses:
+        targets.append('HTTP 400/422 -> 200 (server validates but client trusts status only)')
+    if any(s >= 500 for s in statuses if isinstance(s, int)):
+        targets.append('HTTP 5xx -> 200 (mask backend failure and observe client behaviour)')
+    # Locked / disabled / blocked flags
+    if any(re.search(r'(lock|disabl|block|suspend|ban)', n) for n in all_param_names):
+        targets += [
+            '"locked":true -> false',
+            '"disabled":true -> false',
+            '"blocked":true / "suspended":true -> false',
+        ]
+    # Verified / approved / active flags
+    if any(re.search(r'(verif|approv|active|enabled|confirm)', n) for n in all_param_names):
+        targets += [
+            '"verified":false -> true',
+            '"approved":false -> true',
+            '"active":false / "enabled":false -> true',
+            '"confirmed":false -> true',
+        ]
+    # Payment / order-state flags
+    if any(re.search(r'(paid|payment|order|invoice|refund)', n) for n in all_param_names):
+        targets += [
+            '"paid":false -> true',
+            '"paymentStatus":"pending" -> "paid"',
+            '"orderStatus":"unpaid" -> "shipped"',
+        ]
+    # Subscription / plan / tier
+    if any(re.search(r'(tier|plan|subscription|premium|trial)', n) for n in all_param_names):
+        targets += [
+            '"plan":"free" -> "premium" / "enterprise"',
+            '"subscription":"trial" -> "active"',
+            '"trialExpired":true -> false',
+        ]
+    # Account balance / credit
+    if any(re.search(r'(balance|credit|points|wallet|coin)', n) for n in all_param_names):
+        targets += [
+            '"balance":0 -> 999999',
+            '"credit":<n> -> 999999',
+            '"insufficientFunds":true -> false',
+        ]
+    # Generic UI gating (always worth mentioning)
+    targets.append('Hidden UI: enable disabled buttons, reveal masked fields (CC numbers, SSN, tokens), unhide gated sections.')
+    return targets
+
+
 def _has_sig(values, sigs):
     low = [str(v).lower() for v in values]
     for s in sigs:
@@ -594,35 +745,45 @@ def _heuristics(p):
     fn = _infer_fn(p.path)
     state_changing = bool(p.methods_seen & set(['POST', 'PUT', 'DELETE', 'PATCH']))
 
+    # Pre-login / unauthenticated-by-design endpoints. Access-control gaps like
+    # "never tested without Authorization/Cookie" or "single identity - IDOR
+    # untested" do not apply here because these endpoints are INTENDED to be
+    # reachable anonymously. We still run the brute-force, auth-bypass payload,
+    # structural-tampering, reset-flow, OTP, and response-flip checks below.
+    is_prelogin = bool(fn & set(['auth', 'reset', 'register', 'otp']))
+
     def g(cat, sev, title, detail, evidence, rec, owasp='', kind='test'):
         gaps.append(Gap(ep, cat, sev, title, detail, evidence, rec, owasp, kind))
 
-    # A01: BROKEN ACCESS CONTROL
-    if p.requests_with_auth > 0 and p.requests_without_auth == 0:
-        g('auth', 'CRITICAL' if sens else 'HIGH',
-          'Never tested without Authorization/Cookie',
-          'All requests authenticated. Unauthenticated access never attempted.',
-          '{0} requests, all authenticated'.format(p.requests_with_auth),
-          'Strip Cookie/Authorization. Confirm 401/302, not 200+data. Also try expired/garbage token.',
-          'A01:2021 Broken Access Control', 'coverage')
+    # A01: BROKEN ACCESS CONTROL - skipped for pre-login forms (they are
+    # unauthenticated by design; flagging "no anonymous test" on a login page
+    # is a false positive).
+    if not is_prelogin:
+        if p.requests_with_auth > 0 and p.requests_without_auth == 0:
+            g('auth', 'CRITICAL' if sens else 'HIGH',
+              'Never tested without Authorization/Cookie',
+              'All requests authenticated. Unauthenticated access never attempted.',
+              '{0} requests, all authenticated'.format(p.requests_with_auth),
+              'Strip Cookie/Authorization. Confirm 401/302, not 200+data. Also try expired/garbage token.',
+              'A01:2021 Broken Access Control', 'coverage')
 
-    if len(p.auth_tokens_seen) <= 1 and p.requests_with_auth > 1:
-        g('auth', 'HIGH',
-          'Single identity - horizontal/vertical IDOR untested',
-          'Only one session/token observed. Cross-account and cross-role access not proven.',
-          '{0} distinct token across {1} requests'.format(len(p.auth_tokens_seen), p.requests_with_auth),
-          'Replay with userB cookie keeping userA object ids. Use low-priv token on this endpoint. '
-          'Test cookie-swap, JWT sub/role edit, and no-token.',
-          'A01:2021 Broken Access Control', 'coverage')
+        if len(p.auth_tokens_seen) <= 1 and p.requests_with_auth > 1:
+            g('auth', 'HIGH',
+              'Single identity - horizontal/vertical IDOR untested',
+              'Only one session/token observed. Cross-account and cross-role access not proven.',
+              '{0} distinct token across {1} requests'.format(len(p.auth_tokens_seen), p.requests_with_auth),
+              'Replay with userB cookie keeping userA object ids. Use low-priv token on this endpoint. '
+              'Test cookie-swap, JWT sub/role edit, and no-token.',
+              'A01:2021 Broken Access Control', 'coverage')
 
-    if sens or 'admin' in fn:
-        g('access', 'HIGH',
-          'Function-level access control not proven',
-          'Sensitive/admin function reached only with a privileged session.',
-          'path={0}, methods={1}'.format(p.path, sorted(p.methods_seen)),
-          'Forced-browse with low-priv & anonymous sessions. Test direct POST to the action handler '
-          '(skip the UI gate). Tamper UI-only flags. Check sibling pages (UserList/UserRegistration/etc.).',
-          'A01:2021 Broken Access Control')
+        if sens or 'admin' in fn:
+            g('access', 'HIGH',
+              'Function-level access control not proven',
+              'Sensitive/admin function reached only with a privileged session.',
+              'path={0}, methods={1}'.format(p.path, sorted(p.methods_seen)),
+              'Forced-browse with low-priv & anonymous sessions. Test direct POST to the action handler '
+              '(skip the UI gate). Tamper UI-only flags. Check sibling pages (UserList/UserRegistration/etc.).',
+              'A01:2021 Broken Access Control')
 
     g('access', 'MEDIUM',
       'HTTP method / verb-tampering bypass not tested',
@@ -748,6 +909,12 @@ def _heuristics(p):
           'Set negatives (qty=-1, amount=-100), 0, decimals (0.001), huge ints, currency swap, coupon stacking, '
           'and re-use one-time vouchers. Verify server recomputes server-side.',
           'A04:2021 Insecure Design')
+        g('logic', 'HIGH', 'Structural tampering on price/quantity NOT tested: {0}'.format(", ".join(money[:5])),
+          'Removing the price field entirely, sending empty/null, array-bound values and race-conditions '
+          'on coupon/refund are distinct from value-range fuzzing and frequently bypass server validation.',
+          'params: {0}'.format(money[:5]),
+          STRUCTURAL_PRICE,
+          'A04:2021 Insecure Design')
 
     wf = [k for k in all_params if WORKFLOW_PARAM.search(_norm_param(k))]
     if wf or state_changing:
@@ -806,12 +973,23 @@ def _heuristics(p):
           "Username `' OR '1'='1'-- -`, `admin'-- -`, NoSQL `{\"$ne\":null}`, LDAP `*)(uid=*`, "
           "array-bind `user[]=a`. Also response/JWT-driven client trust bypass.",
           'A07:2021 Identification & Authentication Failures')
+        g('auth', 'CRITICAL', 'Structural parameter tampering on login NOT tested',
+          'Param-removal / empty-value / null / type-confusion / array-bind cases on login fields - '
+          'classic auth-bypass primitives that injection-payload fuzzing misses.',
+          'params: {0}'.format(list(all_params)[:8]),
+          STRUCTURAL_LOGIN,
+          'A07:2021 Identification & Authentication Failures')
     if 'reset' in fn:
         g('auth', 'CRITICAL', 'Password-reset weaknesses not tested',
           'Reset flow - token strength, host-header poisoning, and user-enum not proven.',
           'params: {0}'.format(list(all_params)[:6]),
           'Check token entropy/expiry/single-use; Host/X-Forwarded-Host poisoning to steal reset link; '
           'user-enumeration via response/timing; reset for victim then read token; param pollution on email.',
+          'A07:2021 Identification & Authentication Failures')
+        g('auth', 'CRITICAL', 'Structural parameter tampering on reset NOT tested',
+          'Removing or emptying token/email/code may let the reset proceed without proof of identity.',
+          'params: {0}'.format(list(all_params)[:8]),
+          STRUCTURAL_RESET,
           'A07:2021 Identification & Authentication Failures')
     if 'register' in fn:
         g('auth', 'HIGH', 'Registration abuse not tested',
@@ -820,6 +998,12 @@ def _heuristics(p):
           'Inject role/is_admin during signup; register existing email (account takeover/overwrite); '
           'skip email verification; homoglyph/`+`/dot email tricks; mass-create (no captcha/rate-limit).',
           'A01:2021 Broken Access Control')
+        g('auth', 'HIGH', 'Structural parameter tampering on registration NOT tested',
+          'Empty / missing / array-bound fields plus injected privilege keys give privilege escalation '
+          'at signup time on backends that bind blindly.',
+          'params: {0}'.format(list(all_params)[:8]),
+          STRUCTURAL_REGISTER,
+          'A08:2021 Software & Data Integrity Failures')
     if 'otp' in fn:
         g('auth', 'CRITICAL', 'OTP/2FA bypass not tested',
           'Verification endpoint - brute-force, reuse, and response-tamper not exercised.',
@@ -827,11 +1011,22 @@ def _heuristics(p):
           'Brute 000000-999999 (no rate-limit?); reuse/expired code; response-tamper success flag; '
           'remove 2fa param; race; backup-code abuse; null/`true` value.',
           'A07:2021 Identification & Authentication Failures')
+        g('auth', 'CRITICAL', 'Structural parameter tampering on OTP NOT tested',
+          'Removing/blanking/null-typing the code param is one of the most common 2FA-bypass primitives. '
+          'Replay and race round it out.',
+          'params: {0}'.format(list(all_params)[:6]),
+          STRUCTURAL_OTP,
+          'A07:2021 Identification & Authentication Failures')
     if 'logout' in fn:
         g('logic', 'MEDIUM', 'Session lifecycle / logout CSRF not tested',
           'Logout - server-side invalidation and CSRF not proven.',
           'methods: {0}'.format(sorted(p.methods_seen)),
           'Reuse cookie after logout (server-side kill?); logout CSRF; fixation: does session id rotate on login?',
+          'A07:2021 Identification & Authentication Failures')
+        g('logic', 'MEDIUM', 'Structural / state checks on logout NOT tested',
+          'Session-state misuse around logout: post-logout cookie reuse, fixation, cross-session logout.',
+          'methods: {0}'.format(sorted(p.methods_seen)),
+          STRUCTURAL_LOGOUT,
           'A07:2021 Identification & Authentication Failures')
 
     # JWT
@@ -898,16 +1093,22 @@ def _heuristics(p):
           'deeply-nested query DoS; mutation authz; injection through args; suggestion-leak via typos.',
           'A05:2021 Security Misconfiguration')
 
-    # RESPONSE TAMPERING / CLIENT-SIDE TRUST
+    # RESPONSE TAMPERING / CLIENT-SIDE TRUST - context-specific targets, not generic.
+    flip_targets = _response_flip_targets(p, fn)
+    flips_rendered = "; ".join(flip_targets)
     g('response', 'HIGH' if (sens or 'auth' in fn or 'admin' in fn) else 'MEDIUM',
-      'Response tampering / client-side trust not tested',
-      'If the client (JS/page) makes auth/role/flow decisions from response fields, intercepting and '
-      'editing the RESPONSE can unlock hidden functionality or bypass gating.',
-      'status codes seen: {0}'.format(sorted(p.status_codes_seen)),
-      'In Burp, intercept the RESPONSE (or use Match & Replace): flip `"success":false`->`true`, '
-      '`"isAdmin":false`->`true`, `"role":"user"`->`"admin"`, `403/401`->`200`, `"locked":true`->`false`, '
-      'enable disabled UI / hidden fields, and reveal masked data. Confirm whether the server re-enforces '
-      'server-side or trusts the client.',
+      'Response tampering / client-side trust not tested (endpoint-specific targets below)',
+      'If the client makes auth/role/flow/state decisions from response fields, intercepting and editing '
+      'the RESPONSE (or using Match & Replace) can unlock gated functionality. Targets below are derived '
+      'from this endpoint\'s path, observed parameters, and observed status codes.',
+      'status codes seen: {0}; param hints: {1}'.format(
+          sorted(p.status_codes_seen),
+          [k for k in list(all_params)[:10]]),
+      'In Burp, intercept the RESPONSE (or set a Match & Replace rule). Specific flips to try on THIS endpoint: '
+      + flips_rendered +
+      '. After each flip, confirm whether server-side state actually changed (re-fetch with a clean session) '
+      'or whether only the UI/page believed the flip - if server-side, you have a real auth/logic bug; '
+      'if UI-only, document as defence-in-depth weakness (hidden-field disclosure, UI gating).',
       'A01:2021 Broken Access Control')
 
     # COVERAGE SIGNALS
