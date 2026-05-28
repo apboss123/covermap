@@ -68,7 +68,8 @@ Outputs: **HTML** (interactive, per-endpoint Mermaid mindmaps), **JSON** (feed t
 
 ## Screenshots
 
-<img width="959" height="505" alt="tab" src="https://github.com/user-attachments/assets/16da4235-50df-4222-a8de-bb0203eafbf8" />
+<img width="959" height="505" alt="tab" src="https://github.com/user-attachments/assets/c56a9ee0-9502-4e7e-aba0-02e0535e6f52" />
+
 
 <img width="959" height="431" alt="tab2" src="https://github.com/user-attachments/assets/c05d77b2-cbb4-45f5-9a34-1f229d41cdb3" />
 
