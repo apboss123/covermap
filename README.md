@@ -71,7 +71,7 @@ Outputs: **HTML** (interactive, per-endpoint Mermaid mindmaps), **JSON** (feed t
 _(Drop screenshots into a `screenshots/` folder and reference them here.)_
 
 ```
-![CoverMap tab inside Burp] (tree/main/screenshots/tab.png)
+![CoverMap tab inside Burp](screenshots/tab.png)
 ```
 
 ---
