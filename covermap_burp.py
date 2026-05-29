@@ -265,6 +265,9 @@ FRAMEWORK_PARAMS = set([
     '__async', '__lastfocus', '__scrollpositionx', '__scrollpositiony',
     '__requestverificationtoken', 'csrfmiddlewaretoken', 'authenticity_token',
     '_csrf', 'csrf_token', 'csrftoken',
+    # Synthetic markers injected by the XML body parser (not real app inputs;
+    # consumed only by the XXE heuristic).
+    '__xml_doctype__', '__xml_entity__',
 ])
 
 PARAM_ATTACK_MATRIX = [
@@ -300,6 +303,107 @@ PARAM_ATTACK_MATRIX = [
     ('Overflow/Type', ('-1', '99999', '0x', 'true', 'false', 'null', '[]', '{}', '1e308', '2147483648',
                        '9999999999', "'a'*", 'aaaaaaaaaa'),
      'negative / 0 / huge int / array / object / true|false|null / oversized string'),
+]
+
+
+# ============================================================
+# RESPONSE-CONTENT EVIDENCE (constants + regexes)
+# ============================================================
+
+# Bounds on captured response data, kept small so a large capture does not
+# balloon Burp's JVM heap. Bodies are truncated; only the first N samples per
+# endpoint are retained (enough to spot reflection / errors / secrets).
+RESP_BODY_TRUNC = 16384      # bytes/chars kept per response body snippet
+MAX_RESP_SAMPLES = 10        # response samples retained per endpoint
+
+# Server-side error / stack-trace fingerprints. Presence in a RESPONSE means the
+# class was not merely "tested" but produced a concrete signal -> a FINDING, not
+# a coverage gap.
+SQL_ERROR_RE = re.compile(
+    r'(SQL syntax|mysql_fetch|valid MySQL result|com\.mysql\.jdbc|MySqlException|'
+    r'ORA-\d{5}|Oracle error|quoted string not properly terminated|'
+    r'SQLSTATE\[|PostgreSQL.{0,30}ERROR|PG::\w+Error|psql:|'
+    r'Microsoft OLE DB Provider for SQL Server|ODBC SQL Server Driver|'
+    r'Unclosed quotation mark|System\.Data\.SqlClient\.SqlException|'
+    r'SQLite/JDBCDriver|SQLiteException|sqlite3\.OperationalError|'
+    r'org\.hibernate\.|Npgsql\.)', re.I)
+STACK_TRACE_RE = re.compile(
+    r'(Traceback \(most recent call last\)|'
+    r'at [\w.$]+\([\w.]+\.java:\d+\)|'
+    r'System\.[\w.]+Exception|\bStackTrace\b|'
+    r'File ".*", line \d+|'
+    r'org\.apache\.\w+|javax\.servlet|jakarta\.servlet|'
+    r'Warning: \w+\(\)|Fatal error:|Notice: Undefined|'
+    r'Microsoft \.NET Framework|ASP\.NET is configured to show)', re.I)
+# Sensitive data leaking back in a RESPONSE body -> A02 finding.
+JWT_RE = re.compile(r'eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{6,}')
+APIKEY_RE = re.compile(
+    r'(AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|'             # AWS access key
+    r'AIza[0-9A-Za-z_\-]{35}|'                          # Google API key
+    r'sk_live_[0-9a-zA-Z]{16,}|rk_live_[0-9a-zA-Z]{16,}|'  # Stripe
+    r'xox[baprs]-[0-9A-Za-z\-]{10,}|'                   # Slack
+    r'gh[pousr]_[0-9A-Za-z]{30,}|'                      # GitHub
+    r'-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----)')
+PII_RE = re.compile(
+    r'(\b\d{3}-\d{2}-\d{4}\b|'                          # US SSN
+    r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b)')  # card PANs
+
+# Response headers worth inspecting for misconfiguration.
+HTML_CT_RE = re.compile(r'text/html|application/xhtml', re.I)
+
+
+# ============================================================
+# PATH NORMALISATION (auditable module-level rule list)
+# ============================================================
+
+# Collection nouns: when one of these is the PREVIOUS path segment, a following
+# slug-shaped segment (john-doe, my-product-name) is treated as a variable id so
+# /products/blue-widget and /products/red-widget collapse to one endpoint.
+COLLECTION_NOUNS = set([
+    'users', 'user', 'accounts', 'account', 'customers', 'customer',
+    'members', 'member', 'products', 'product', 'items', 'item', 'orders',
+    'order', 'posts', 'post', 'articles', 'article', 'comments', 'comment',
+    'categories', 'category', 'groups', 'group', 'teams', 'team', 'projects',
+    'project', 'files', 'file', 'documents', 'document', 'docs', 'doc',
+    'invoices', 'invoice', 'tickets', 'ticket', 'messages', 'message',
+    'profiles', 'profile', 'companies', 'company', 'organizations',
+    'organization', 'orgs', 'org', 'tags', 'tag', 'pages', 'page', 'blogs',
+    'blog', 'events', 'event', 'sessions', 'session', 'tokens', 'token',
+    'repos', 'repo', 'repositories', 'channels', 'channel', 'folders', 'folder',
+])
+
+_RX_UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+_RX_OBJECTID = re.compile(r'^[0-9a-f]{24}$', re.I)               # Mongo ObjectId
+_RX_EMAIL_SEG = re.compile(r'^[^/@\s]+@[^/@\s]+\.[a-z]{2,}$', re.I)
+_RX_HEXTOKEN = re.compile(r'^[0-9a-f]{32,}$', re.I)             # md5/sha/hex session ids
+_RX_INT = re.compile(r'^\d{2,}$')
+_RX_SLUG = re.compile(r'^(?=.{4,})[a-z0-9]+(?:[-_.][a-z0-9]+)+$', re.I)  # has a separator
+
+
+def _looks_b64_token(seg):
+    """Long base64 / base64url-ish token: >=20 chars, mixed alnum (+ optional
+    -_=), containing at least one digit AND one letter so dictionary words
+    ('documentation', 'administration') are NOT collapsed."""
+    if len(seg) < 20 or len(seg) > 256:
+        return False
+    if not re.match(r'^[A-Za-z0-9_\-]+={0,2}$', seg):
+        return False
+    has_alpha = bool(re.search(r'[A-Za-z]', seg))
+    has_digit = bool(re.search(r'[0-9]', seg))
+    has_sep_or_case = ('-' in seg or '_' in seg or '=' in seg or
+                       (re.search(r'[a-z]', seg) and re.search(r'[A-Z]', seg)))
+    return has_alpha and has_digit and has_sep_or_case
+
+
+# Ordered, auditable rule list. Each entry: (name, matcher, placeholder).
+# matcher is a compiled regex (.match) or a callable predicate. First hit wins.
+PATH_SEGMENT_RULES = [
+    ('uuid',     _RX_UUID,         '{uuid}'),
+    ('objectid', _RX_OBJECTID,     '{objectid}'),
+    ('email',    _RX_EMAIL_SEG,    '{email}'),
+    ('hextoken', _RX_HEXTOKEN,     '{hextoken}'),
+    ('int',      _RX_INT,          '{id}'),
+    ('b64token', _looks_b64_token, '{token}'),
 ]
 
 
@@ -354,6 +458,23 @@ class EndpointProfile(object):
         self.tools_seen = set()          # e.g. {'Proxy','Scanner','Repeater','Intruder'}
         self.scanner_hits = 0            # requests issued by Burp Scanner (active audit)
         self.intruder_hits = 0           # requests issued by Burp Intruder (fuzzing)
+        # ── Captured RESPONSE evidence (bounded; see RESP_BODY_TRUNC / MAX_RESP_SAMPLES) ──
+        self.response_samples = []       # [{'status','len','body','ct'}] truncated bodies
+        self.response_headers_seen = {}  # lower-name -> set(observed values)  (misconfig checks)
+        self.set_cookies_seen = []       # raw Set-Cookie header strings (bounded)
+        self.reflected_values = set()    # tested param values found verbatim in a response body
+        # ── Cross-identity object access (IDOR/BOLA evidence) ──
+        # identity_fingerprint -> { id_like_param_value -> (best_status, best_len) }
+        self.identity_object_access = {}
+        # ── GraphQL operation tracking (read from request bodies) ──
+        self.graphql_ops = set()         # operationName(s) / first selected field(s) seen
+        self.graphql_introspection = False   # was __schema/__type ever requested?
+        # ── Per-identity request order / timing (Logger++ Time / RTT columns) ──
+        self.request_timeline = []       # [(timestamp_str, method, identity_fp, path_with_qs)]
+        self.response_times = []         # numeric round-trip times when the export carries them
+        # ── XML body observed (XXE surface) ──
+        self.xml_body_seen = False
+        self.multipart_seen = False
 
 
 class EndpointAudit(object):
@@ -382,8 +503,20 @@ class EndpointAudit(object):
 # ============================================================
 
 def parse_loggerpp(filepath, fmt, filter_static=True,
-                   scope=None, exclude_paths=None, logger=None):
+                   scope=None, exclude_paths=None, logger=None, strict=False):
     raw = []
+    # Parse-failure accounting. A pentester MUST know what was silently dropped
+    # (e.g. a row with a non-int Length), so we count failures and - in strict
+    # mode - log the offending row instead of swallowing it.
+    stats = {'failures': 0, 'reasons': defaultdict(int)}
+
+    def _record_failure(idx, exc, rowrepr):
+        stats['failures'] += 1
+        reason = "{0}: {1}".format(type(exc).__name__, exc)
+        stats['reasons'][reason] += 1
+        if strict and logger:
+            logger("  DROPPED row #{0} ({1}): {2}".format(idx, reason, _trunc(rowrepr, 200)))
+
     if fmt == 'json':
         f = open(filepath, 'rb')
         try:
@@ -399,24 +532,45 @@ def parse_loggerpp(filepath, fmt, filter_static=True,
             entries = data
         else:
             entries = data.get('log', data.get('entries', []))
+        idx = 0
         for e in entries:
-            r = _from_json(e)
+            idx += 1
+            try:
+                r = _from_json(e)
+            except Exception as exc:
+                _record_failure(idx, exc, repr(e))
+                continue
             if r:
                 raw.append(r)
+            else:
+                _record_failure(idx, ValueError('unrecognised/empty entry'), repr(e))
     else:
         # Read in binary mode; csv module in Py2/Jython prefers byte strings.
         f = open(filepath, 'rb')
         try:
             reader = csv.DictReader(f)
+            idx = 0
             for row in reader:
-                r = _from_csv(row)
+                idx += 1
+                try:
+                    r = _from_csv(row)
+                except Exception as exc:
+                    _record_failure(idx, exc, repr(row))
+                    continue
                 if r:
                     raw.append(r)
+                else:
+                    _record_failure(idx, ValueError('row missing required fields'), repr(row))
         finally:
             f.close()
 
     if logger:
         logger("Parsed {0} raw requests".format(len(raw)))
+        if stats['failures']:
+            logger("  WARNING: dropped {0} row(s) on parse failure{1}".format(
+                stats['failures'], "" if strict else " (enable Strict mode to log each)"))
+            for reason, cnt in sorted(stats['reasons'].items(), key=lambda kv: -kv[1])[:5]:
+                logger("    - {0}x {1}".format(cnt, reason))
 
     if filter_static:
         before = len(raw)
@@ -460,38 +614,53 @@ def _in_scope(host, scope):
     return False
 
 
-def _from_json(e):
-    try:
-        if isinstance(e.get('Request'), dict):
-            req = e['Request']
-            resp = e.get('Response') or {}
-            url = req.get('URL') or req.get('PathQuery') or req.get('Path', '')
-            parsed = urlparse(url)
-            return {
-                'method':      (req.get('Method') or 'GET').upper(),
-                'host':        req.get('Hostname') or req.get('Host', ''),
-                'path':        req.get('Path') or parsed.path or '/',
-                'query':       parsed.query or urlparse(req.get('PathQuery', '')).query,
-                'raw_request': _raw_request_from_loggerpp(req),
-                'status':      int(resp.get('Status') or 0),
-                'resp_len':    int(resp.get('BodyLength') or resp.get('Length') or 0),
-                'tool':        req.get('Tool') or e.get('Tool') or '',
-            }
+def _safe_int(*candidates):
+    """First candidate that parses as an int, else 0. A blank/None is skipped;
+    a genuinely non-numeric value (e.g. Length='abc') raises so the row is
+    surfaced by the parse-failure counter rather than silently zeroed."""
+    for c in candidates:
+        if c is None or c == '':
+            continue
+        return int(c)
+    return 0
 
-        url = e.get('url') or e.get('URL') or e.get('path', '')
+
+def _from_json(e):
+    if isinstance(e.get('Request'), dict):
+        req = e['Request']
+        resp = e.get('Response') or {}
+        url = req.get('URL') or req.get('PathQuery') or req.get('Path', '')
         parsed = urlparse(url)
         return {
-            'method':      (e.get('method') or e.get('Method') or 'GET').upper(),
-            'host':        e.get('host') or e.get('Host') or e.get('serverHostname', ''),
-            'path':        parsed.path or '/',
-            'query':       parsed.query,
-            'raw_request': e.get('request') or e.get('Request') or '',
-            'status':      int(e.get('responseStatus') or e.get('status') or e.get('Status') or 0),
-            'resp_len':    int(e.get('responseBodyLength') or e.get('responseLength') or e.get('length') or 0),
-            'tool':        e.get('tool') or e.get('Tool') or '',
+            'method':      (req.get('Method') or 'GET').upper(),
+            'host':        req.get('Hostname') or req.get('Host', ''),
+            'path':        req.get('Path') or parsed.path or '/',
+            'query':       parsed.query or urlparse(req.get('PathQuery', '')).query,
+            'raw_request': _raw_request_from_loggerpp(req),
+            'raw_response': _raw_response_from_loggerpp(resp),
+            'status':      _safe_int(resp.get('Status'), 0),
+            'resp_len':    _safe_int(resp.get('BodyLength'), resp.get('Length'), 0),
+            'tool':        req.get('Tool') or e.get('Tool') or '',
+            'timestamp':   e.get('Time') or e.get('Timestamp') or req.get('Time') or '',
+            'rtt':         _safe_int(e.get('ResponseTime'), e.get('RTT'),
+                                     resp.get('ResponseTime'), 0) or None,
         }
-    except Exception:
-        return None
+
+    url = e.get('url') or e.get('URL') or e.get('path', '')
+    parsed = urlparse(url)
+    return {
+        'method':      (e.get('method') or e.get('Method') or 'GET').upper(),
+        'host':        e.get('host') or e.get('Host') or e.get('serverHostname', ''),
+        'path':        parsed.path or '/',
+        'query':       parsed.query,
+        'raw_request': e.get('request') or e.get('Request') or '',
+        'raw_response': _maybe_b64_response(e.get('response') or e.get('Response') or ''),
+        'status':      _safe_int(e.get('responseStatus'), e.get('status'), e.get('Status'), 0),
+        'resp_len':    _safe_int(e.get('responseBodyLength'), e.get('responseLength'), e.get('length'), 0),
+        'tool':        e.get('tool') or e.get('Tool') or '',
+        'timestamp':   e.get('time') or e.get('Time') or e.get('timestamp') or '',
+        'rtt':         _safe_int(e.get('responseTime'), e.get('rtt'), 0) or None,
+    }
 
 
 def _raw_request_from_loggerpp(req):
@@ -509,28 +678,49 @@ def _raw_request_from_loggerpp(req):
     return "{0}\r\n{1}\r\n\r\n{2}".format(line, headers, body)
 
 
+def _raw_response_from_loggerpp(resp):
+    """Reconstruct a raw HTTP response from a Logger++ JSON Response object.
+    Prefers AsBase64 (full bytes); falls back to Headers + Body fields."""
+    if not isinstance(resp, dict):
+        return _u(resp) if resp else ''
+    b64 = resp.get('AsBase64')
+    if b64:
+        try:
+            return base64.b64decode(b64).decode('utf-8', 'replace')
+        except Exception:
+            pass
+    headers = resp.get('Headers') or ''
+    body = resp.get('Body') or ''
+    if not headers and not body:
+        return ''
+    return "{0}\r\n\r\n{1}".format(headers, body)
+
+
 def _from_csv(row):
     """Maps Burp default CSV (ID,Time,Tool,Method,Protocol,Host,Port,URL,IP,
     Path,Query,Param count,Param names,Status code,Length,MIME type,Extension,
     Page title,...Request,Response) AND Logger++ CSV variants."""
-    try:
-        url = row.get('URL') or row.get('url') or row.get('Path', '')
-        parsed = urlparse(url)
-        raw_req = _maybe_b64_request(row.get('Request') or row.get('request') or '')
-        return {
-            'method':      (row.get('Method') or row.get('method') or 'GET').upper(),
-            'host':        row.get('Host') or row.get('host') or row.get('Hostname', ''),
-            'path':        row.get('Path') or row.get('path') or parsed.path or '/',
-            'query':       row.get('Query') or row.get('query') or parsed.query,
-            'raw_request': raw_req,
-            'status':      int(row.get('Status code') or row.get('Status') or row.get('ResponseStatus') or row.get('status') or 0),
-            'resp_len':    int(row.get('ResponseBodyLength') or row.get('Length') or row.get('length') or 0),
-            # Burp default CSV has a 'Tool' column (Proxy/Scanner/Intruder/Repeater/...).
-            # This is definitive evidence of HOW an endpoint was tested.
-            'tool':        row.get('Tool') or row.get('tool') or '',
-        }
-    except Exception:
-        return None
+    url = row.get('URL') or row.get('url') or row.get('Path', '')
+    parsed = urlparse(url)
+    raw_req = _maybe_b64_request(row.get('Request') or row.get('request') or '')
+    raw_resp = _maybe_b64_response(row.get('Response') or row.get('response') or '')
+    return {
+        'method':      (row.get('Method') or row.get('method') or 'GET').upper(),
+        'host':        row.get('Host') or row.get('host') or row.get('Hostname', ''),
+        'path':        row.get('Path') or row.get('path') or parsed.path or '/',
+        'query':       row.get('Query') or row.get('query') or parsed.query,
+        'raw_request': raw_req,
+        'raw_response': raw_resp,
+        'status':      _safe_int(row.get('Status code'), row.get('Status'),
+                                 row.get('ResponseStatus'), row.get('status'), 0),
+        'resp_len':    _safe_int(row.get('ResponseBodyLength'), row.get('Length'),
+                                 row.get('length'), 0),
+        # Burp default CSV has a 'Tool' column (Proxy/Scanner/Intruder/Repeater/...).
+        # This is definitive evidence of HOW an endpoint was tested.
+        'tool':        row.get('Tool') or row.get('tool') or '',
+        'timestamp':   row.get('Time') or row.get('time') or row.get('Timestamp') or '',
+        'rtt':         _safe_int(row.get('RTT'), row.get('ResponseReceived'), 0) or None,
+    }
 
 
 def _maybe_b64_request(s):
@@ -543,6 +733,23 @@ def _maybe_b64_request(s):
     try:
         decoded = base64.b64decode(stripped).decode('utf-8', 'replace')
         if re.match(method_re, decoded) or 'HTTP/' in decoded[:256]:
+            return decoded
+    except Exception:
+        pass
+    return s
+
+
+def _maybe_b64_response(s):
+    """Burp's CSV base64-encodes the Response column; Logger++ may give raw.
+    Return the decoded raw HTTP response text ('HTTP/1.1 200 ...')."""
+    if not s:
+        return ''
+    stripped = s.strip()
+    if stripped[:5].upper() == 'HTTP/':
+        return s
+    try:
+        decoded = base64.b64decode(stripped).decode('utf-8', 'replace')
+        if decoded[:5].upper() == 'HTTP/' or 'HTTP/' in decoded[:32]:
             return decoded
     except Exception:
         pass
@@ -563,6 +770,103 @@ def _parse_headers(raw):
     return headers
 
 
+def _flatten_json(obj, prefix=''):
+    """Recurse a parsed JSON value into dotted/indexed keys so nested fields are
+    visible to the classifiers (user.role, items[0].price) instead of being
+    collapsed into one opaque value. This is what lets mass-assignment detection
+    see a nested privilege key. Returns {dotted_key: [values]}."""
+    out = {}
+    if isinstance(obj, dict):
+        if not obj and prefix:
+            out.setdefault(prefix, []).append('{}')
+        for k, v in obj.items():
+            key = "{0}.{1}".format(prefix, _u(k)) if prefix else _u(k)
+            if isinstance(v, (dict, list)):
+                child = _flatten_json(v, key)
+                if child:
+                    for ck, cv in child.items():
+                        out.setdefault(ck, []).extend(cv)
+                else:
+                    out.setdefault(key, []).append('')
+            else:
+                out.setdefault(key, []).append(_u(v))
+    elif isinstance(obj, list):
+        if not obj and prefix:
+            out.setdefault(prefix, []).append('[]')
+        for idx, v in enumerate(obj):
+            key = "{0}[{1}]".format(prefix, idx)
+            if isinstance(v, (dict, list)):
+                child = _flatten_json(v, key)
+                for ck, cv in child.items():
+                    out.setdefault(ck, []).extend(cv)
+            else:
+                out.setdefault(key, []).append(_u(v))
+    else:
+        if prefix:
+            out.setdefault(prefix, []).append(_u(obj))
+    return out
+
+
+_MULTIPART_BOUNDARY_RE = re.compile(r'boundary=("?)([^";\r\n]+)\1', re.I)
+_CD_NAME_RE = re.compile(r'\bname="?([^";\r\n]+?)"?(?:;|\r|\n|$)', re.I)
+_CD_FILENAME_RE = re.compile(r'\bfilename\*?="?([^";\r\n]*?)"?(?:;|\r|\n|$)', re.I)
+
+
+def _parse_multipart(body, ct):
+    """multipart/form-data -> {field_name: [value]} plus, for file parts,
+    {field_name: [filename]} and a `field_name.filename` pseudo-param so the
+    file-upload heuristic sees field names AND uploaded filenames/extensions."""
+    out = {}
+    m = _MULTIPART_BOUNDARY_RE.search(ct or '')
+    if not m:
+        return out
+    boundary = '--' + m.group(2)
+    for part in body.split(boundary):
+        part = part.strip('\r\n')
+        if not part or part == '--' or part.strip() == '--':
+            continue
+        seg = re.split(r'\r?\n\r?\n', part, maxsplit=1)
+        head = seg[0]
+        val = seg[1].rstrip('\r\n') if len(seg) > 1 else ''
+        nm = _CD_NAME_RE.search(head)
+        if not nm:
+            continue
+        name = nm.group(1).strip()
+        fm = _CD_FILENAME_RE.search(head)
+        if fm:
+            fname = fm.group(1).strip()
+            out.setdefault(name, []).append(fname)
+            out.setdefault(name + '.filename', []).append(fname)
+        else:
+            out.setdefault(name, []).append(_u(val))
+    return out
+
+
+_XML_TAG_RE = re.compile(r'<\s*([A-Za-z_][\w\-.:]*)')
+_XML_ATTR_RE = re.compile(r'([A-Za-z_][\w\-.:]*)\s*=\s*["\']')
+
+
+def _parse_xml_params(body):
+    """text/xml or application/xml -> expose element + attribute NAMES as params
+    so the XXE/XML surface is visible to the analyser. The synthetic
+    `__xml_doctype__` / `__xml_entity__` keys flag that a DOCTYPE/ENTITY was
+    already present (i.e. XXE may have been attempted)."""
+    out = {}
+    low = body.lower()
+    if '<!doctype' in low:
+        out['__xml_doctype__'] = ['present']
+    if '<!entity' in low or 'system "' in low or "system '" in low:
+        out['__xml_entity__'] = ['present']
+    for tag in _XML_TAG_RE.findall(body):
+        t = tag.strip()
+        if not t or t.startswith('!') or t.startswith('?') or t.lower() == 'xml':
+            continue
+        out.setdefault(t, []).append('')
+    for attr in _XML_ATTR_RE.findall(body):
+        out.setdefault(attr, []).append('')
+    return out
+
+
 def _parse_body_params(raw, ct):
     if not raw:
         return {}
@@ -570,26 +874,138 @@ def _parse_body_params(raw, ct):
     if len(parts) < 2 or not parts[1].strip():
         return {}
     body = parts[1].strip()
-    if 'application/json' in ct:
+    ctl = (ct or '').lower()
+    if 'application/json' in ctl or ctl.endswith('+json') or '+json' in ctl:
         try:
             parsed = json.loads(body)
-            if isinstance(parsed, dict):
-                out = {}
-                for k, v in parsed.items():
-                    out[k] = [_u(v)]
-                return out
+            flat = _flatten_json(parsed)
+            if flat:
+                return flat
         except Exception:
             pass
+    if 'multipart/form-data' in ctl:
+        mp = _parse_multipart(body, ct)
+        if mp:
+            return mp
+    if 'xml' in ctl:                       # text/xml, application/xml, +xml
+        xml = _parse_xml_params(body)
+        if xml:
+            return xml
     try:
         return dict(parse_qs(body, keep_blank_values=True))
     except Exception:
         return {}
 
 
+def _split_response(raw):
+    """Split a raw HTTP response into (header-block, body). Body may be empty."""
+    if not raw:
+        return '', ''
+    parts = re.split(r'\r?\n\r?\n', raw, maxsplit=1)
+    head = parts[0]
+    body = parts[1] if len(parts) > 1 else ''
+    return head, body
+
+
+def _parse_response_headers(raw):
+    """(headers_dict, set_cookie_list) from a raw HTTP response. headers_dict is
+    lower-name -> last value; Set-Cookie is collected separately as a list since
+    a response can legitimately carry several."""
+    headers = {}
+    cookies = []
+    head, _body = _split_response(raw)
+    if not head:
+        return headers, cookies
+    for line in head.split('\n')[1:]:        # skip the status line
+        line = line.strip()
+        if not line or ':' not in line:
+            continue
+        k, _sep, v = line.partition(':')
+        kl = k.strip().lower()
+        vv = v.strip()
+        if kl == 'set-cookie':
+            cookies.append(vv)
+        headers[kl] = vv
+    return headers, cookies
+
+
 def _normalise_path(path):
-    path = re.sub(r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '/{uuid}', path, flags=re.I)
-    path = re.sub(r'/\d{2,}', '/{id}', path)
-    return path
+    """Collapse variable path segments (ids, UUIDs, Mongo ObjectIds, hex/base64
+    tokens, email-shaped segments, and slugs after a collection noun) so that
+    /user/john.doe, /docs/5f8a..., /products/blue-widget etc. do not each
+    fragment into a separate 'endpoint' and inflate the report. Rules live in the
+    auditable module-level PATH_SEGMENT_RULES list."""
+    if not path:
+        return path
+    segs = path.split('/')
+    out = []
+    prev = ''
+    for seg in segs:
+        if seg == '':
+            out.append(seg)
+            continue
+        placeholder = None
+        for _name, matcher, ph in PATH_SEGMENT_RULES:
+            try:
+                hit = matcher(seg) if callable(matcher) else matcher.match(seg)
+            except Exception:
+                hit = None
+            if hit:
+                placeholder = ph
+                break
+        if placeholder is None and prev.lower() in COLLECTION_NOUNS and _RX_SLUG.match(seg):
+            placeholder = '{slug}'
+        out.append(placeholder if placeholder else seg)
+        prev = seg
+    return '/'.join(out)
+
+
+def _identity_fingerprint(hdrs):
+    """Stable, non-secret identity key for a request: hash of Authorization, else
+    Cookie, else X-API-Key. Requests with no credential return 'anon'. Used to
+    correlate which identity accessed which object id (IDOR/BOLA evidence)."""
+    auth_val = (hdrs.get('authorization') or hdrs.get('cookie') or
+                hdrs.get('x-api-key') or hdrs.get('x-auth-token') or
+                hdrs.get('x-access-token') or '')
+    auth_val = _u(auth_val).strip()
+    if not auth_val:
+        return 'anon'
+    return hashlib.md5(auth_val.encode('utf-8')).hexdigest()[:12]
+
+
+_GQL_FIELD_RE = re.compile(r'\b(query|mutation|subscription)\b\s*\w*\s*(?:\([^)]*\))?\s*\{\s*([A-Za-z_][\w]*)', re.I)
+
+
+def _extract_graphql(p, raw_request, hdrs):
+    """Read a GraphQL request body (JSON {query, operationName, variables} or a
+    raw query string) and record the operations exercised + whether
+    introspection (__schema/__type) was actually attempted."""
+    ct = hdrs.get('content-type', '')
+    _head, body = _split_response(raw_request)   # reuse: header/body splitter
+    body = (body or '').strip()
+    if not body:
+        return
+    query = ''
+    opname = ''
+    try:
+        if 'json' in ct.lower() or body[:1] in ('{', '['):
+            data = json.loads(body)
+            if isinstance(data, list) and data:        # batched query
+                data = data[0]
+            if isinstance(data, dict):
+                query = _u(data.get('query') or '')
+                opname = _u(data.get('operationName') or '')
+        if not query:
+            query = body
+    except Exception:
+        query = body
+    if opname:
+        p.graphql_ops.add(opname)
+    for _kw, field in _GQL_FIELD_RE.findall(query):
+        if field and not field.startswith('__'):
+            p.graphql_ops.add(field)
+    if '__schema' in query or '__type' in query or 'IntrospectionQuery' in (opname + query):
+        p.graphql_introspection = True
 
 
 # Characters that never appear in a legitimate HTTP parameter NAME but do appear
@@ -652,6 +1068,7 @@ def build_profiles(requests):
         key = "{0}{1}".format(req['host'], path)
         eid = hashlib.md5(key.encode('utf-8')).hexdigest()[:12]
         hdrs = _parse_headers(req['raw_request'])
+        _ct = hdrs.get('content-type', '').lower()
         bparams = _parse_body_params(req['raw_request'], hdrs.get('content-type', ''))
         qparams = {}
         try:
@@ -669,6 +1086,10 @@ def build_profiles(requests):
         if eid not in profiles:
             profiles[eid] = EndpointProfile(host=req['host'], path=path, endpoint_id=eid)
         p = profiles[eid]
+        if 'xml' in _ct:
+            p.xml_body_seen = True
+        if 'multipart/form-data' in _ct:
+            p.multipart_seen = True
         p.total_requests += 1
         p.methods_seen.add(req['method'])
         p.status_codes_seen.add(req['status'])
@@ -713,6 +1134,7 @@ def build_profiles(requests):
             if h in AUTH_HEADERS:
                 any_auth = True
                 break
+        identity = _identity_fingerprint(hdrs)
         if any_auth:
             p.requests_with_auth += 1
             token = hdrs.get('authorization', hdrs.get('cookie', ''))
@@ -723,6 +1145,82 @@ def build_profiles(requests):
         for h in hdrs:
             if h in SECURITY_HEADERS:
                 p.headers_modified.add(h)
+
+        # ── Cross-identity object access (IDOR/BOLA evidence) ──
+        # Record, per identity, which id-like parameter VALUES were requested and
+        # how successful the access was. Two different identities requesting the
+        # same id value is what turns the IDOR check from a guess into evidence.
+        status = req.get('status') or 0
+        resp_len = req.get('resp_len') or 0
+        for d in (qparams, bparams):
+            for pname, pvals in d.items():
+                if _u(pname).strip().lower() in FRAMEWORK_PARAMS:
+                    continue
+                if not IDOR_PARAM.search(_norm_param(pname)):
+                    continue
+                for v in pvals:
+                    vv = _u(v).strip()
+                    if not vv or len(vv) > 128:
+                        continue
+                    acc = p.identity_object_access.setdefault(identity, {})
+                    cand = (status, resp_len)
+                    prev = acc.get(vv)
+                    if (prev is None or
+                            (cand[0] == 200 and prev[0] != 200) or
+                            (cand[0] == prev[0] and cand[1] > prev[1])):
+                        acc[vv] = cand
+
+        # ── RESPONSE capture (bounded) ──
+        raw_resp = req.get('raw_response') or ''
+        if raw_resp:
+            rhdrs, rcookies = _parse_response_headers(raw_resp)
+            for hk, hv in rhdrs.items():
+                p.response_headers_seen.setdefault(hk, set()).add(hv[:256])
+            for ck in rcookies:
+                if len(p.set_cookies_seen) < 50:
+                    p.set_cookies_seen.append(ck)
+            _rhead, rbody = _split_response(raw_resp)
+            rbody = rbody or ''
+            if len(p.response_samples) < MAX_RESP_SAMPLES:
+                p.response_samples.append({
+                    'status': status, 'len': resp_len,
+                    'ct': rhdrs.get('content-type', ''),
+                    'body': rbody[:RESP_BODY_TRUNC],
+                })
+            # Reflected-value detection: a tested param value appearing verbatim in
+            # the response body is real reflection -> drives XSS/reflection
+            # confidence and suppresses the blind "XSS not tested" gap.
+            if rbody:
+                rblow = rbody.lower()
+                for d in (qparams, bparams):
+                    for pname, pvals in d.items():
+                        if _u(pname).strip().lower() in FRAMEWORK_PARAMS:
+                            continue
+                        for v in pvals:
+                            vv = _u(v).strip()
+                            # Require a reasonably distinctive value so common
+                            # words/short ids don't register as false reflections.
+                            if len(vv) >= 6 and vv.lower() in rblow:
+                                p.reflected_values.add(vv[:80])
+
+        # ── GraphQL operation tracking ──
+        if PATH_GRAPHQL.search(path):
+            try:
+                _extract_graphql(p, req['raw_request'], hdrs)
+            except Exception:
+                pass
+
+        # ── Per-identity request order / timing ──
+        ts = req.get('timestamp') or ''
+        if ts or req.get('rtt'):
+            qs = req.get('query') or ''
+            path_with_qs = req['path'] + (("?" + qs) if qs else "")
+            p.request_timeline.append((_u(ts), req['method'], identity, path_with_qs))
+        if req.get('rtt'):
+            try:
+                p.response_times.append(float(req['rtt']))
+            except Exception:
+                pass
 
         if len(p.sample_requests) < 5:
             p.sample_requests.append({
@@ -972,17 +1470,55 @@ def _decode_variants(v):
     return out
 
 
+# Signature matching is word-boundary aware for "word-ish" signatures so that
+# `union` no longer matches inside `reunion`, `or 1=1` inside an opaque value, or
+# `id` inside `valid`. Symbol-bearing signatures (../  ' or '  <script  %0a)
+# keep substring semantics because word boundaries don't apply to them.
+_SIG_RX_CACHE = {}
+_WORDISH_SIG_RE = re.compile(r'^[\w][\w\s=]*$')
+
+
+def _compile_sig(sig):
+    if _WORDISH_SIG_RE.match(sig):
+        return re.compile(r'(?<!\w)' + re.escape(sig) + r'(?!\w)', re.I)
+    return None     # signal: use plain substring
+
+
+def _sig_present(value, sig):
+    if sig not in _SIG_RX_CACHE:
+        _SIG_RX_CACHE[sig] = _compile_sig(sig)
+    rx = _SIG_RX_CACHE[sig]
+    if rx is None:
+        return sig in value
+    return bool(rx.search(value))
+
+
 def _has_sig(values, sigs):
-    """True if any tested value (raw OR URL-decoded) contains an attack
-    signature. Decoding is what lets encoded WAF-bypass payloads still count."""
+    """True if any tested value (raw OR URL-decoded) carries an attack signature,
+    matched with word-boundary awareness. Decoding lets encoded WAF-bypass
+    payloads still count."""
     low = []
     for v in values:
         low.extend(_decode_variants(v))
     for s in sigs:
         for v in low:
-            if s in v:
+            if _sig_present(v, s):
                 return True
     return False
+
+
+def _sig_strength(values, sigs):
+    """Number of DISTINCT tested values that carry one of the signatures. Drives
+    a confidence weight: a single payload on a single value is weak evidence and
+    must not credit the whole attack class for the endpoint at full weight."""
+    hits = set()
+    for v in values:
+        variants = _decode_variants(v)
+        for s in sigs:
+            if any(_sig_present(var, s) for var in variants):
+                hits.add(_u(v)[:120])
+                break
+    return len(hits)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1196,6 +1732,203 @@ def _is_nonexistent_endpoint(p):
     return (404 in statuses) and (len(real) == 0)
 
 
+# ─────────────────────────────────────────────────────────────────
+# RESPONSE-DRIVEN & CROSS-IDENTITY EVIDENCE
+# These read captured RESPONSES (not just request payloads), turning
+# coverage GAPS into concrete FINDINGS where the evidence supports it.
+# ─────────────────────────────────────────────────────────────────
+
+def _cross_identity_idor(p):
+    """Correlate object ids across identities.
+
+    Returns (tested, crit_evidence):
+      tested        - True if the SAME id-like value was requested under >=2
+                      distinct identities (IDOR is then EVIDENCE-tested, not a
+                      blind gap).
+      crit_evidence - dict when one identity successfully fetched (HTTP 200 +
+                      non-trivial body) an id that ANOTHER identity also used,
+                      i.e. a likely confirmed BOLA. None otherwise."""
+    # value -> set(identities that used it); value -> identity that fetched 200+body
+    value_identities = defaultdict(set)
+    value_success = {}
+    for ident, objmap in p.identity_object_access.items():
+        for val, (st, ln) in objmap.items():
+            value_identities[val].add(ident)
+            if st == 200 and ln > 64:
+                value_success.setdefault(val, set()).add(ident)
+
+    tested = any(len(idents) >= 2 for idents in value_identities.values())
+
+    crit = None
+    for val, idents in value_identities.items():
+        if len(idents) < 2:
+            continue
+        succ = value_success.get(val, set())
+        # A confirmed cross-identity fetch: at least one identity got a real 200
+        # body for an id that >=2 identities referenced.
+        if succ:
+            crit = {
+                'value': val,
+                'identities': len(idents),
+                'fetched_by': len(succ),
+            }
+            break
+    return tested, crit
+
+
+def _response_blob(p, limit=4):
+    """Concatenated (lowercased-safe) response bodies, bounded, for scanning."""
+    parts = []
+    for s in p.response_samples[:limit]:
+        b = s.get('body') or ''
+        if b:
+            parts.append(_u(b))
+    return "\n".join(parts)
+
+
+def _response_content_findings(p):
+    """Findings derived from RESPONSE bodies: server-side error/stack fingerprints
+    (-> injection finding) and sensitive-data leakage (-> A02 finding). Returns a
+    list of (severity, title, detail, evidence, recommendation, owasp)."""
+    out = []
+    blob = _response_blob(p, limit=MAX_RESP_SAMPLES)
+    if not blob:
+        return out
+
+    m = SQL_ERROR_RE.search(blob)
+    if m:
+        out.append(('CRITICAL', 'SQL error string returned in response',
+                    'A database error/exception leaked into a response body - strong evidence the input '
+                    'reaches a SQL sink unsanitised (error-based SQLi likely).',
+                    'matched: {0}'.format(_trunc(m.group(0), 60)),
+                    'Confirm with boolean/UNION/error-based payloads; enumerate via the leaked DBMS error format. '
+                    'This is a FINDING, not a coverage gap.',
+                    'A03:2021 Injection'))
+    m = STACK_TRACE_RE.search(blob)
+    if m:
+        out.append(('HIGH', 'Stack trace / framework error leaked in response',
+                    'An unhandled exception/stack trace reached the client - leaks framework, file paths and '
+                    'code structure, and signals missing error handling around a sink.',
+                    'matched: {0}'.format(_trunc(m.group(0), 60)),
+                    'Map the disclosed stack; many injection/deserialization bugs surface here first. '
+                    'Report verbose errors (A05) and pursue the underlying sink.',
+                    'A05:2021 Security Misconfiguration'))
+    if JWT_RE.search(blob):
+        out.append(('HIGH', 'JWT present in response body',
+                    'A JSON Web Token was returned in a response body (not just a header/cookie) - check whether '
+                    'it leaks another user\'s token or carries sensitive claims.',
+                    'JWT pattern matched in response body',
+                    'Decode the JWT; verify it is the caller\'s own token, scope/claims are minimal, and it is not '
+                    'reflected from another identity. Test alg confusion / weak-secret separately.',
+                    'A02:2021 Cryptographic Failures'))
+    m = APIKEY_RE.search(blob)
+    if m:
+        out.append(('CRITICAL', 'API key / secret material in response body',
+                    'High-entropy credential (cloud key / API token / private key) returned to the client.',
+                    'matched: {0}'.format(_trunc(m.group(0), 24)),
+                    'Validate the key is live and scoped; this is a direct secret-exposure FINDING. Rotate + report.',
+                    'A02:2021 Cryptographic Failures'))
+    if PII_RE.search(blob):
+        out.append(('HIGH', 'PII (SSN / card-number pattern) in response body',
+                    'A response body contained a value matching an SSN or payment-card number pattern.',
+                    'PII pattern matched in response body',
+                    'Confirm it is real PII (not a test fixture) and that the caller is authorised to see it; '
+                    'check for over-broad object responses (BOLA / excessive data exposure).',
+                    'A02:2021 Cryptographic Failures'))
+    return out
+
+
+def _response_header_findings(p, fn):
+    """Misconfiguration findings read from captured RESPONSE headers / Set-Cookie:
+    reflective CORS, missing/weak CSP, insecure cookies, missing HSTS on auth."""
+    out = []
+    rh = p.response_headers_seen
+    if not rh and not p.set_cookies_seen:
+        return out
+
+    def vals(name):
+        return rh.get(name, set())
+
+    acao = vals('access-control-allow-origin')
+    acac = vals('access-control-allow-credentials')
+    if acao:
+        acac_true = any('true' in _u(v).lower() for v in acac)
+        reflects = any(_u(v).strip() not in ('', '*') for v in acao)
+        if '*' in set(_u(v).strip() for v in acao) and acac_true:
+            out.append(('HIGH', 'CORS: wildcard ACAO with credentials',
+                        'Access-Control-Allow-Origin: * together with Allow-Credentials: true is invalid-but-dangerous '
+                        'and, where honoured, exposes authenticated responses cross-site.',
+                        'ACAO={0}; ACAC=true'.format(_join_clean(acao, limit=3)),
+                        'Confirm the browser honours it; restrict ACAO to a vetted allowlist and drop credentials for *.',
+                        'A05:2021 Security Misconfiguration'))
+        elif reflects and acac_true:
+            out.append(('HIGH', 'CORS: origin-reflected ACAO with credentials',
+                        'The server reflects an Origin into Access-Control-Allow-Origin while allowing credentials - '
+                        'an attacker-controlled origin can read authenticated responses.',
+                        'ACAO={0}; ACAC=true'.format(_join_clean(acao, limit=3)),
+                        'Re-send with Origin: https://evil.com and Origin: null; if reflected with ACAC:true it is exploitable.',
+                        'A05:2021 Security Misconfiguration'))
+
+    # Missing/weak CSP on an HTML response.
+    is_html = any(HTML_CT_RE.search(_u(v)) for v in vals('content-type'))
+    if is_html and not vals('content-security-policy'):
+        out.append(('MEDIUM', 'Missing Content-Security-Policy on HTML response',
+                    'No CSP header on an HTML response - removes a key defence-in-depth control against XSS/injection.',
+                    'content-type indicates HTML; no CSP header observed',
+                    'Add a restrictive CSP; absence raises the impact of any reflected/stored XSS on this surface.',
+                    'A05:2021 Security Misconfiguration'))
+
+    # Insecure Set-Cookie flags.
+    for ck in p.set_cookies_seen[:20]:
+        low = ck.lower()
+        name = ck.split('=', 1)[0].strip()
+        missing = []
+        if 'httponly' not in low:
+            missing.append('HttpOnly')
+        if 'secure' not in low:
+            missing.append('Secure')
+        if 'samesite' not in low:
+            missing.append('SameSite')
+        if missing:
+            out.append(('MEDIUM', 'Set-Cookie `{0}` missing: {1}'.format(name, ", ".join(missing)),
+                        'A cookie was set without {0}. Missing HttpOnly aids XSS cookie theft; missing Secure allows '
+                        'plaintext leakage; missing SameSite enables CSRF.'.format(", ".join(missing)),
+                        _trunc(ck, 80),
+                        'Set HttpOnly, Secure and SameSite=Lax/Strict on session cookies.',
+                        'A05:2021 Security Misconfiguration'))
+            break    # one representative cookie finding is enough per endpoint
+
+    # Missing HSTS on an auth-class endpoint.
+    if 'auth' in fn and not vals('strict-transport-security'):
+        out.append(('MEDIUM', 'Missing HSTS on authentication endpoint',
+                    'No Strict-Transport-Security header on an auth endpoint - permits SSL-strip / downgrade against '
+                    'credential traffic.',
+                    'no strict-transport-security header observed',
+                    'Add HSTS (long max-age, includeSubDomains, preload) on all auth/HTTPS surfaces.',
+                    'A05:2021 Security Misconfiguration'))
+    return out
+
+
+def _prior_step_hint(p):
+    """Name a concrete prior step for the workflow-bypass recommendation using the
+    reconstructed per-identity request order, instead of generic 'the prior step'."""
+    if not p.request_timeline:
+        return ''
+    # Sort by timestamp string (ISO-ish sorts correctly); fall back to capture order.
+    try:
+        ordered = sorted(p.request_timeline, key=lambda t: t[0])
+    except Exception:
+        ordered = list(p.request_timeline)
+    paths = []
+    for _ts, method, _ident, pq in ordered:
+        label = "{0} {1}".format(method, pq.split('?')[0])
+        if label not in paths:
+            paths.append(label)
+    if len(paths) < 2:
+        return ''
+    return paths[-2]    # the step immediately before this endpoint's own request
+
+
 def _heuristics(p):
     gaps = []
     credits = [0]   # count of test-classes proven exercised (drives the score up on retest)
@@ -1223,8 +1956,14 @@ def _heuristics(p):
     def g(cat, sev, title, detail, evidence, rec, owasp='', kind='test'):
         gaps.append(Gap(ep, cat, sev, title, detail, evidence, rec, owasp, kind))
 
-    def credit(n=1):
-        credits[0] += n
+    def credit(n=1, confidence=1.0):
+        # `confidence` lets weak evidence (a single payload on a single value)
+        # credit a class only partially, so it cannot fully mark the whole
+        # attack class "tested" for the endpoint.
+        credits[0] += n * confidence
+
+    # Cross-identity object-access correlation (computed once; reused below).
+    xident_tested, xident_crit = _cross_identity_idor(p)
 
     # A01: BROKEN ACCESS CONTROL - skipped for pre-login forms (they are
     # unauthenticated by design; flagging "no anonymous test" on a login page
@@ -1238,10 +1977,33 @@ def _heuristics(p):
               'Strip Cookie/Authorization. Confirm 401/302, not 200+data. Also try expired/garbage token.',
               'A01:2021 Broken Access Control', 'coverage')
 
-        if len(p.auth_tokens_seen) <= 1 and p.requests_with_auth > 1:
+        # IDOR/BOLA. Cross-identity correlation upgrades this from a guess to
+        # evidence: if the SAME id value was requested under >=2 identities the
+        # access-control test was actually performed (credit + suppress gap); if
+        # one identity then fetched a real 200 body for an id another identity
+        # also used, emit a CONFIRMED finding.
+        if xident_crit:
+            g('auth', 'CRITICAL',
+              'Cross-identity object access CONFIRMED (likely IDOR/BOLA)',
+              'An id-like value was requested under {0} distinct identities and at least one identity received a '
+              'HTTP 200 with a non-trivial body for it - strong evidence of horizontal/vertical object-access '
+              'control failure.'.format(xident_crit['identities']),
+              'shared id value `{0}` used by {1} identities; fetched 200+body by {2}'.format(
+                  _trunc(xident_crit['value'], 40), xident_crit['identities'], xident_crit['fetched_by']),
+              'Diff the two identities\' responses for the same id; confirm userB reads userA\'s object. '
+              'Then sweep adjacent ids to size the blast radius. This is a FINDING, not a coverage gap.',
+              'A01:2021 Broken Access Control', 'finding')
+            credit()
+        elif xident_tested:
+            # Same id seen under >=2 identities but no confirmed successful fetch:
+            # the IDOR test WAS performed (e.g. returned 403), so credit it and do
+            # not raise the blind "single identity" gap.
+            credit()
+        elif len(p.auth_tokens_seen) <= 1 and p.requests_with_auth > 1:
             g('auth', 'HIGH',
               'Single identity - horizontal/vertical IDOR untested',
-              'Only one session/token observed. Cross-account and cross-role access not proven.',
+              'Only one session/token observed. Cross-account and cross-role access not proven. '
+              '(No id-like value was observed requested under two different identities.)',
               '{0} distinct token across {1} requests'.format(len(p.auth_tokens_seen), p.requests_with_auth),
               'Replay with userB cookie keeping userA object ids. Use low-priv token on this endpoint. '
               'Test cookie-swap, JWT sub/role edit, and no-token.',
@@ -1306,13 +2068,29 @@ def _heuristics(p):
                   "`1);WAITFOR DELAY '0:0:5'--` ; UNION: `' UNION SELECT NULL-- -` ; stacked. " + WAF_BYPASS,
                   'A03:2021 Injection')
 
-        if XSS_PARAM.search(np) and not scanner_audited and not _has_sig(values, ('<script', 'onerror', 'onload', 'javascript:', '<img', '<svg', 'alert(')):
+        # Reflected-value detection (response-driven): if any tested value for
+        # this param came back verbatim in a response body, reflection is PROVEN -
+        # raise confidence to a finding and stop reporting a blind "XSS not tested".
+        param_reflected = any(_u(v).strip()[:80] in p.reflected_values
+                              for v in values if _u(v).strip())
+        if XSS_PARAM.search(np) and param_reflected:
+            g('injection', 'HIGH', 'Reflected input on `{0}` (response-confirmed)'.format(param),
+              '`{0}` was echoed verbatim in a response body - reflection is confirmed, so XSS is plausible '
+              'pending context/encoding analysis.'.format(param), ev,
+              "Confirm the reflection context (HTML body / attribute / JS / URL) and test a context-matched "
+              "breakout: `\"><svg onload=alert(1)>`, `\" autofocus onfocus=alert(1) x=\"`, `';alert(1)//`. "
+              "Check output encoding and CSP. This is response-evidence, not a blind gap.",
+              'A03:2021 Injection', 'finding')
+            credit()
+        elif XSS_PARAM.search(np) and not scanner_audited and not _has_sig(values, ('<script', 'onerror', 'onload', 'javascript:', '<img', '<svg', 'alert(')):
             g('injection', 'HIGH', 'XSS not tested on `{0}`'.format(param),
               '`{0}` is reflected/stored candidate.'.format(param), ev,
               "Reflected: `\"><svg onload=alert(1)>` ; attribute break `\" autofocus onfocus=alert(1) x=\"` ; "
               "JS context `';alert(1)//` ; stored: submit then view render page; "
               "polyglot `jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcliCk=alert() )//`. Check CSP.",
               'A03:2021 Injection')
+        elif XSS_PARAM.search(np) and not scanner_audited:
+            credit()    # an XSS payload signature was present -> class exercised
 
         if CMD_PARAM.search(np) and not scanner_audited and not _has_sig(values, (';', '|', '&&', '`', '$(', '%0a', 'sleep ', 'ping ')):
             g('injection', 'HIGH', 'OS command injection not tested on `{0}`'.format(param),
@@ -1347,8 +2125,12 @@ def _heuristics(p):
         # coverage instead of false "not tested" gaps.
         untested = []
         for (cls, sigs, pl) in PARAM_ATTACK_MATRIX:
-            if _has_sig(values, sigs):
-                credit()
+            strength = _sig_strength(values, sigs)
+            if strength:
+                # One payload on one value is weak evidence (0.5); >=2 distinct
+                # payloads is a real fuzzing pass (1.0). Confidence keeps a lone
+                # stray signature from fully crediting the class.
+                credit(confidence=1.0 if strength >= 2 else 0.5)
                 continue
             if cls == 'Overflow/Type' and param_struct:
                 credit()
@@ -1410,6 +2192,30 @@ def _heuristics(p):
           'and multipart. XML accepted -> test XXE/SSRF/billion-laughs.',
           'A03:2021 Injection')
 
+    # XXE: an XML body was actually observed -> the XXE surface is real, not
+    # hypothetical. If a DOCTYPE/ENTITY was already present an XXE attempt was
+    # likely made (credit); otherwise flag the untested XML surface.
+    if p.xml_body_seen:
+        xxe_attempted = ('__xml_doctype__' in p.body_params or '__xml_entity__' in p.body_params)
+        if xxe_attempted:
+            credit()
+            g('injection', 'HIGH', 'XML body with DOCTYPE/ENTITY observed - confirm XXE',
+              'An XML request body containing a DOCTYPE/ENTITY declaration was captured - an XXE attempt was '
+              'likely made. Confirm whether external entities resolve.',
+              'xml elements: {0}'.format(_join_clean(
+                  [k for k in p.body_params if not k.startswith('__xml')], limit=8)),
+              'Confirm file read (`file:///etc/passwd`), SSRF via entity (`http://169.254.169.254/...`), and '
+              'billion-laughs DoS; test parameter entities + OOB exfiltration via external DTD.',
+              'A05:2021 Security Misconfiguration')
+        else:
+            g('injection', 'HIGH', 'XML body accepted - XXE not tested',
+              'This endpoint consumes XML, so the XXE attack surface is real. No DOCTYPE/ENTITY was observed in '
+              'captured bodies, so XXE was not exercised.',
+              'xml elements: {0}'.format(_join_clean(list(p.body_params), limit=8)),
+              'Inject `<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]>&e;`; test SSRF entity, parameter '
+              'entities, external-DTD OOB exfil, and billion-laughs. Also try XInclude if DOCTYPE is filtered.',
+              'A05:2021 Security Misconfiguration')
+
     # A04/A08: BUSINESS LOGIC & RACE
     money = [k for k in all_params if PRICE_PARAM.search(_norm_param(k))]
     if money:
@@ -1428,9 +2234,14 @@ def _heuristics(p):
 
     wf = [k for k in all_params if WORKFLOW_PARAM.search(_norm_param(k))]
     if wf or state_changing:
+        prior = _prior_step_hint(p)
+        prior_txt = ("Observed immediately-prior step for this identity: `{0}` - try skipping it / replaying "
+                     "this endpoint without first hitting it. ".format(prior)) if prior else ""
         g('logic', 'MEDIUM', 'Workflow/step bypass & race conditions not tested',
           'Multi-step or state-changing flow may skip steps or double-spend under concurrency.',
-          'state-changing={0}, step params={1}'.format(state_changing, wf[:5]),
+          'state-changing={0}, step params={1}, prior step={2}'.format(
+              state_changing, wf[:5], prior or 'unknown'),
+          prior_txt +
           'Jump to final step directly; replay confirm step; remove prerequisites. '
           'Race: fire 20-50 parallel requests (single-packet attack) for coupon/refund/withdraw/vote double-use.',
           'A04:2021 Insecure Design')
@@ -1646,12 +2457,39 @@ def _heuristics(p):
           'SVG/HTML XSS, path traversal in filename, zip-slip, huge file DoS. Find upload dir & request the file.',
           'A05:2021 Security Misconfiguration')
     if 'graphql' in fn:
-        g('injection', 'HIGH', 'GraphQL abuse not tested',
-          'GraphQL endpoint - introspection, batching and depth abuse not exercised.',
-          'path={0}'.format(p.path),
-          'Enable introspection `__schema`; field/alias batching for brute-force & rate-limit bypass; '
-          'deeply-nested query DoS; mutation authz; injection through args; suggestion-leak via typos.',
-          'A05:2021 Security Misconfiguration')
+        ops_seen = sorted(p.graphql_ops)
+        ops_txt = _join_clean(ops_seen, limit=12) if ops_seen else 'none parsed from bodies'
+        # Only claim introspection wasn't tested if it actually wasn't attempted.
+        if p.graphql_introspection:
+            credit()
+            g('injection', 'MEDIUM', 'GraphQL: introspection WAS attempted - verify it is disabled',
+              'A __schema/__type introspection query was observed against this endpoint. Confirm whether the '
+              'server answered it (schema disclosure) or rejected it.',
+              'operations seen: {0}'.format(ops_txt),
+              'If introspection succeeds, dump the full schema and map every query/mutation; then test field/alias '
+              'batching for rate-limit bypass, deeply-nested query DoS, and per-mutation authorization.',
+              'A05:2021 Security Misconfiguration')
+        else:
+            g('injection', 'HIGH', 'GraphQL abuse not tested (no introspection attempt observed)',
+              'GraphQL endpoint - introspection, batching and depth abuse not exercised. '
+              '(Heuristic: no __schema/__type query seen in captured request bodies.)',
+              'operations seen: {0}'.format(ops_txt),
+              'Send introspection `{{__schema{{types{{name}}}}}}`; field/alias batching for brute-force & '
+              'rate-limit bypass; deeply-nested query DoS; mutation authz; injection through args; '
+              'suggestion-leak via typos.',
+              'A05:2021 Security Misconfiguration')
+        # Surface which operations were exercised vs. which appeared in responses,
+        # so the analyst can spot mutations that were never authz-tested.
+        resp_blob = _response_blob(p, limit=MAX_RESP_SAMPLES)
+        ops_in_resp = sorted(o for o in p.graphql_ops if o and o in resp_blob)
+        if ops_seen:
+            g('injection', 'LOW', 'GraphQL operations exercised: {0}'.format(_join_clean(ops_seen, limit=8)),
+              'Operations parsed from request bodies on this endpoint. Use as the authz/abuse test checklist - '
+              'each mutation needs an explicit object/role authorization test.',
+              'in requests: {0} | echoed in responses: {1}'.format(
+                  _join_clean(ops_seen, limit=8), _join_clean(ops_in_resp, limit=8) or 'none'),
+              'For each mutation, replay under a low-privilege identity and confirm server-side authorization.',
+              'A01:2021 Broken Access Control', 'coverage')
 
     # RESPONSE TAMPERING / CLIENT-SIDE TRUST - context-specific targets, not generic.
     flip_targets = _response_flip_targets(p, fn)
@@ -1689,6 +2527,16 @@ def _heuristics(p):
           'Multiple requests, no param variation or response variance.',
           '{0} requests, no variation'.format(p.total_requests),
           'Explicitly test in Repeater with targeted param manipulation.', '', 'coverage')
+
+    # ── RESPONSE-DRIVEN FINDINGS (read from captured response bodies/headers) ──
+    # These are concrete evidence, not coverage gaps, so they are emitted as
+    # kind='finding' (they do not penalise the coverage score) and the relevant
+    # class is credited since it was demonstrably exercised.
+    for (sev, title, detail, evidence, rec, owasp) in _response_content_findings(p):
+        g('finding', sev, title, detail, evidence, rec, owasp, 'finding')
+        credit()
+    for (sev, title, detail, evidence, rec, owasp) in _response_header_findings(p, fn):
+        g('header', sev, title, detail, evidence, rec, owasp, 'finding')
 
     return gaps, credits[0]
 
@@ -1759,11 +2607,34 @@ def analyse(profiles):
             sample_requests=p.sample_requests,
             gaps=gaps,
         )
-        audit.tests_credited = credits   # test classes proven exercised (climbs on retest)
+        audit.tests_credited = round(credits, 1)   # test classes proven exercised (climbs on retest)
         audit.tools_seen = sorted(p.tools_seen)
         audit.scanner_audited = _scanner_audited(p)
         audit.scanner_hits = p.scanner_hits
         audit.intruder_hits = p.intruder_hits
+        # New RESPONSE / cross-identity / GraphQL evidence (surfaced in JSON).
+        xident_tested, xident_crit = _cross_identity_idor(p)
+        audit.response_evidence = {
+            'responses_captured': len(p.response_samples),
+            'reflected_values': sorted(p.reflected_values)[:20],
+            'set_cookies_seen': p.set_cookies_seen[:10],
+            'response_headers': dict((k, sorted(v)[:5]) for k, v in p.response_headers_seen.items()),
+        }
+        audit.cross_identity = {
+            'identities_seen': len(p.identity_object_access),
+            'idor_tested': bool(xident_tested),
+            'confirmed_bola': xident_crit,
+        }
+        audit.graphql = {
+            'operations': sorted(p.graphql_ops),
+            'introspection_attempted': p.graphql_introspection,
+        } if (p.graphql_ops or p.graphql_introspection) else None
+        audit.response_times = {
+            'count': len(p.response_times),
+            'min': min(p.response_times) if p.response_times else None,
+            'max': max(p.response_times) if p.response_times else None,
+            'avg': (sum(p.response_times) / len(p.response_times)) if p.response_times else None,
+        } if p.response_times else None
         audits.append(audit)
     audits.sort(key=lambda a: a.coverage_score)
     return audits
@@ -1891,8 +2762,13 @@ def to_json(audits):
             "coverage_score": a.coverage_score, "coverage_label": score_label(a.coverage_score),
             "tests_credited": getattr(a, 'tests_credited', 0),
             "test_gaps_remaining": sum(1 for gp in a.gaps if gp.kind == 'test'),
+            "findings_count": sum(1 for gp in a.gaps if gp.kind == 'finding'),
             "tools_seen": getattr(a, 'tools_seen', []),
             "scanner_audited": getattr(a, 'scanner_audited', False),
+            "response_evidence": getattr(a, 'response_evidence', {}),
+            "cross_identity": getattr(a, 'cross_identity', {}),
+            "graphql": getattr(a, 'graphql', None),
+            "response_times": getattr(a, 'response_times', None),
             "methods_seen": a.methods_seen, "query_params": a.query_params,
             "body_params": a.body_params, "auth_coverage": a.auth_coverage,
             "status_codes": a.status_codes, "response_length_range": a.response_length_range,
@@ -1906,15 +2782,98 @@ def to_json(audits):
     return json.dumps(out, indent=2)
 
 
+def _gap_gid(endpoint_id, gp):
+    """Stable per-gap id, identical across re-runs of CoverMap as long as the
+    endpoint + category + OWASP tag + title are unchanged. localStorage keys in
+    the HTML report are derived from this, so analyst progress (status/notes)
+    survives re-generation of the report."""
+    raw = u"{0}|{1}|{2}|{3}".format(endpoint_id, gp.category, gp.owasp or u'', gp.title)
+    return hashlib.md5(raw.encode('utf-8')).hexdigest()[:12]
+
+
+# Severity -> CSS tag class (shared by findings + endpoint gap rows).
+_SEV_TAG = {'CRITICAL': 't-crit', 'HIGH': 't-high', 'MEDIUM': 't-med', 'LOW': 't-low'}
+# Stable status <select>; JS sets the active value from localStorage on load.
+_STATUS_SELECT = (
+    '<select class="g-status">'
+    '<option>Open</option><option>In Progress</option><option>Tested</option>'
+    '<option>False Positive</option><option>N/A</option><option>Confirmed Finding</option>'
+    '</select>')
+
+
+def _html_gap_row(a, gp):
+    """One interactive checklist row for a single gap. Carries a stable data-gid,
+    a 'done' checkbox, a status <select>, a collapsible notes <textarea>, and
+    data-* attributes the client-side filters key off. No literal braces in the
+    .format template; all dynamic text routed through _html_escape()."""
+    gid = _gap_gid(a.endpoint_id, gp)
+    sev = gp.severity
+    sevcls = _SEV_TAG.get(sev, 't-low')
+    kind = gp.kind or 'coverage'
+    default_status = 'Confirmed Finding' if kind == 'finding' else 'Open'
+    owasp_badge = ('<span class="owasp">{0}</span>'.format(_html_escape(gp.owasp))
+                   if gp.owasp else '')
+    search = _html_escape(u" ".join([
+        _u(gp.title), _u(gp.detail), _u(gp.evidence), _u(gp.recommendation)]).lower())
+    return (
+        '<div class="gap-row k-{kind} gs-{sev}" data-gid="{gid}" data-sev="{sev}" '
+        'data-kind="{kind}" data-owasp="{owasp}" data-default-status="{dstatus}" '
+        'data-search="{search}">'
+        '<div class="gap-head">'
+        '<input type="checkbox" class="g-check" title="Mark tested / done">'
+        '<span class="tag {sevcls}">{sev}</span>{owasp_badge}'
+        '<span class="g-title">{title}</span>'
+        '{status_select}'
+        '<button type="button" class="g-note-toggle" title="Toggle analyst notes">note</button>'
+        '</div>'
+        '<div class="gap-body">'
+        '<div class="muted">{detail}</div>'
+        '<div class="ev">Evidence: <code>{evidence}</code></div>'
+        '<div class="rec">Test / Fix: {rec}</div>'
+        '<textarea class="g-note hidden" placeholder="Analyst notes (saved in this browser)..."></textarea>'
+        '</div></div>'
+    ).format(
+        kind=_html_escape(kind), sev=sev, sevcls=sevcls, gid=gid,
+        owasp=_html_escape(gp.owasp or ''), dstatus=default_status, search=search,
+        owasp_badge=owasp_badge, title=_html_escape(gp.title),
+        status_select=_STATUS_SELECT, detail=_html_escape(gp.detail),
+        evidence=_html_escape(gp.evidence), rec=_html_escape(gp.recommendation))
+
+
 def to_html(audits, engagement):
+    """Self-contained interactive HTML report. The analyst drives it as a live
+    engagement checklist: per-gap done/status/notes persist to window.localStorage
+    (namespaced by engagement so multiple reports don't collide), with filtering,
+    progress tracking, collapsible cards, JSON export and print-friendly CSS."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     total = len(audits)
     total_gaps = sum(len(a.gaps) for a in audits)
     critical = sum(1 for a in audits for gp in a.gaps if gp.severity == 'CRITICAL')
     high = sum(1 for a in audits for gp in a.gaps if gp.severity == 'HIGH')
     avg = sum(a.coverage_score for a in audits) // max(total, 1)
-    sev_tag = {'CRITICAL': 't-crit', 'HIGH': 't-high', 'MEDIUM': 't-med', 'LOW': 't-low'}
 
+    # ── Confirmed Findings (kind=='finding'), pinned at the top ──
+    finding_pairs = [(a, gp) for a in audits for gp in a.gaps if gp.kind == 'finding']
+    _sevorder = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3}
+    finding_pairs.sort(key=lambda t: _sevorder.get(t[1].severity, 9))
+    findings_count = len(finding_pairs)
+    if finding_pairs:
+        findings_rows = "".join(_html_gap_row(a, gp) for a, gp in finding_pairs)
+        findings_html = (
+            '  <section id="findings-sec" class="findings">'
+            '<h2 class="sec-title">Confirmed Findings (' + str(findings_count) + ')</h2>'
+            '<div class="finding-note muted">Evidence-backed results pinned at the top &mdash; '
+            'these are confirmed signals, not to-dos.</div>'
+            + findings_rows + '</section>\n')
+    else:
+        findings_html = ''
+
+    # ── OWASP filter options ──
+    owasp_set = sorted(set(gp.owasp for a in audits for gp in a.gaps if gp.owasp))
+    owasp_opts = '<option value="__all__">All OWASP</option>' + "".join(
+        '<option value="{0}">{0}</option>'.format(_html_escape(o)) for o in owasp_set)
+
+    # ── Endpoint cards (coverage/test gaps only; findings live in the top section) ──
     cards = []
     i = 0
     for a in audits:
@@ -1939,19 +2898,12 @@ def to_html(audits, engagement):
                     mind.append("        {0} {1}".format(_mermaid_safe(gp.severity), _mermaid_safe(gp.title)))
         mermaid_src = "\n".join(mind)
 
-        gap_items = []
+        gap_rows = []
         for sev in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
-            for gp in [x for x in a.gaps if x.severity == sev]:
-                owasp_badge = '<span class="owasp">{0}</span>'.format(_html_escape(gp.owasp)) if gp.owasp else ''
-                gap_items.append(
-                    '<li><span class="tag {0}">{1}</span>{2}<b>{3}</b><br>'
-                    '<span class="muted">{4}</span><br>'
-                    'Evidence: <code>{5}</code><br>'
-                    'Test / Fix: {6}</li>'.format(
-                        sev_tag[sev], sev, owasp_badge,
-                        _html_escape(gp.title), _html_escape(gp.detail),
-                        _html_escape(gp.evidence), _html_escape(gp.recommendation)))
-        gaps_html = ("<ol>" + "".join(gap_items) + "</ol>") if gap_items else "<p class='muted'>No gaps flagged.</p>"
+            for gp in [x for x in a.gaps if x.severity == sev and x.kind != 'finding']:
+                gap_rows.append(_html_gap_row(a, gp))
+        card_rows = ("".join(gap_rows) if gap_rows
+                     else '<p class="muted">No coverage gaps flagged (see Confirmed Findings above).</p>')
 
         sc = a.coverage_score
         score_cls = 's-bad' if sc < 40 else ('s-mid' if sc < 70 else 's-ok')
@@ -1962,26 +2914,32 @@ def to_html(audits, engagement):
         if getattr(a, 'scanner_audited', False):
             tools_txt += " (Scanner-audited: injection classes credited)"
         cards.append(
-            '\n  <div class="ep">\n'
-            '    <h2>EP{0} &mdash; {1}</h2>\n'
-            '    <div class="meta">\n'
-            '      <span class="score {2}">{3}/100 &middot; {4}</span>\n'
-            '      <span>Behavior: <b>{5}</b></span>\n'
-            '      <span>Requests: <b>{6}</b></span>\n'
-            '      <span>Methods: <b>{7}</b></span>\n'
-            '      <span>Auth: <b>{8}</b> auth / <b>{9}</b> unauth</span>\n'
-            '      <span>Tests proven: <b>{12}</b> / {13} remaining</span>\n'
-            '      <span>Tested by: <b>{14}</b></span>\n'
-            '    </div>\n'
-            '    <pre class="mermaid">\n{10}\n    </pre>\n'
-            '    <div class="missed"><h3>Gaps / Missed Test Cases</h3>{11}</div>\n'
-            '  </div>'.format(
-                i, _html_escape(ep), score_cls, sc, score_label(sc),
-                _html_escape(a.behavior_class.upper()), a.total_requests,
-                _html_escape(", ".join(a.methods_seen)),
-                a.auth_coverage['with_auth'], a.auth_coverage['without_auth'],
-                mermaid_src, gaps_html, credited, test_gaps_n, _html_escape(tools_txt)))
+            '  <div class="ep" id="ep-{epid}">'
+            '<div class="ep-head">'
+            '<h2>EP{n} &mdash; {ep}</h2>'
+            '<div class="meta">'
+            '<span class="score {scls}">{sc}/100 &middot; {slabel}</span>'
+            '<span>Behavior: <b>{beh}</b></span>'
+            '<span>Requests: <b>{req}</b></span>'
+            '<span>Methods: <b>{meth}</b></span>'
+            '<span>Auth: <b>{aw}</b> auth / <b>{au}</b> unauth</span>'
+            '<span>Tests proven: <b>{cred}</b> / {trem} remaining</span>'
+            '<span>Tested by: <b>{tools}</b></span>'
+            '<span class="ep-counter muted"></span>'
+            '<button type="button" class="diagram-btn">diagram</button>'
+            '</div></div>'
+            '<div class="ep-body">'
+            '<div class="diagram-wrap hidden"><pre class="mermaid">\n{mermaid}\n</pre></div>'
+            '<div class="missed"><h3>Gaps / Missed Test Cases</h3>{rows}</div>'
+            '</div></div>\n'.format(
+                epid=_html_escape(a.endpoint_id), n=i, ep=_html_escape(ep), scls=score_cls,
+                sc=sc, slabel=score_label(sc), beh=_html_escape(a.behavior_class.upper()),
+                req=a.total_requests, meth=_html_escape(", ".join(a.methods_seen)),
+                aw=a.auth_coverage['with_auth'], au=a.auth_coverage['without_auth'],
+                cred=credited, trem=test_gaps_n, tools=_html_escape(tools_txt),
+                mermaid=mermaid_src, rows=card_rows))
 
+    # ── CSS (concatenated; never passed through .format because it has braces) ──
     css = (
         ":root { --bg:#0f1419; --card:#1b232d; --line:#2c3a47; --txt:#e6edf3; --muted:#9bb0c0;"
         "        --accent:#4ea1ff; --crit:#ff5d5d; --high:#ffa64d; --med:#ffe066; --low:#7dd3fc; }"
@@ -1990,61 +2948,315 @@ def to_html(audits, engagement):
         "       font-family:'Segoe UI',Roboto,Arial,sans-serif; line-height:1.5; padding:32px; }"
         "h1 { font-size:1.6rem; margin:0 0 4px; }"
         ".sub { color:var(--muted); font-size:.9rem; margin-bottom:20px; }"
-        ".summary { display:flex; flex-wrap:wrap; gap:14px; margin-bottom:24px; }"
+        ".summary { display:flex; flex-wrap:wrap; gap:14px; margin-bottom:18px; }"
         ".stat { background:var(--card); border:1px solid var(--line); border-radius:10px;"
         "        padding:12px 18px; min-width:120px; }"
         ".stat .n { font-size:1.5rem; font-weight:700; }"
         ".stat .l { color:var(--muted); font-size:.78rem; text-transform:uppercase; letter-spacing:.05em; }"
+        ".toolbar { position:sticky; top:0; z-index:50; background:#0c1116cc; backdrop-filter:blur(4px);"
+        "           border:1px solid var(--line); border-radius:10px; padding:10px 14px; margin-bottom:16px; }"
+        ".tb-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px; font-size:.85rem; }"
+        ".toolbar label { color:var(--muted); }"
+        ".toolbar select, .toolbar input[type=text] { background:#1b232d; color:var(--txt);"
+        "           border:1px solid var(--line); border-radius:6px; padding:4px 8px; font-size:.85rem; }"
+        ".toolbar input[type=text] { min-width:220px; }"
+        ".tb-spacer { flex:1 1 auto; }"
+        ".btn { background:#243447; color:#cfe6ff; border:1px solid #355068; border-radius:6px;"
+        "       padding:6px 12px; font-size:.82rem; cursor:pointer; }"
+        ".btn:hover { background:#2c3e50; }"
+        ".btn-danger { background:#3a1f24; color:#ffb3b3; border-color:#6a2f37; }"
+        ".prog-wrap { display:flex; align-items:center; gap:12px; margin-bottom:22px; }"
+        ".prog-bar { flex:1 1 auto; height:12px; background:#0c1116; border:1px solid var(--line);"
+        "            border-radius:8px; overflow:hidden; }"
+        ".prog-fill { height:100%; width:0; background:linear-gradient(90deg,#4ea1ff,#76d59a); transition:width .2s; }"
+        ".prog-text { color:var(--muted); font-size:.85rem; white-space:nowrap; }"
+        ".sec-title { font-size:1.15rem; margin:0 0 6px; }"
+        ".findings { background:var(--card); border:1px solid var(--line); border-left:4px solid var(--crit);"
+        "            border-radius:12px; padding:16px 20px; margin-bottom:24px; }"
+        ".finding-note { font-size:.8rem; margin-bottom:10px; }"
         ".ep { background:var(--card); border:1px solid var(--line); border-radius:12px;"
-        "      padding:20px 24px; margin-bottom:24px; }"
-        ".ep h2 { font-size:1.1rem; margin:0 0 10px; color:var(--accent);"
+        "      padding:14px 20px; margin-bottom:18px; }"
+        ".ep-head { cursor:pointer; }"
+        ".ep h2 { font-size:1.05rem; margin:0 0 8px; color:var(--accent);"
         "         font-family:Consolas,monospace; word-break:break-all; }"
-        ".meta { display:flex; flex-wrap:wrap; gap:16px; font-size:.85rem; color:var(--muted); margin-bottom:14px; }"
+        ".ep.collapsed .ep-body { display:none; }"
+        ".meta { display:flex; flex-wrap:wrap; gap:14px; font-size:.82rem; color:var(--muted); margin-bottom:8px;"
+        "        align-items:center; }"
         ".meta b { color:var(--txt); }"
+        ".ep-counter { font-size:.8rem; }"
         ".score { padding:2px 10px; border-radius:6px; font-weight:700; color:#0f1419; }"
         ".s-bad { background:var(--crit); } .s-mid { background:var(--med); } .s-ok { background:#76d59a; }"
+        ".diagram-btn { background:#243447; color:#9bd0ff; border:1px solid #355068; border-radius:6px;"
+        "               padding:2px 8px; font-size:.74rem; cursor:pointer; }"
+        ".diagram-wrap { margin:8px 0 12px; } .diagram-wrap.hidden { display:none; }"
         ".mermaid { background:#fbfdff; border-radius:8px; padding:12px; overflow-x:auto; }"
-        ".missed { margin-top:16px; }"
+        ".missed { margin-top:8px; }"
         ".missed h3 { font-size:.8rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 8px; }"
-        "ol { margin:0; padding-left:22px; } li { margin-bottom:12px; }"
         ".muted { color:var(--muted); }"
+        ".gap-row { border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-bottom:8px; background:#161d26; }"
+        ".gap-row.k-finding { border-left:4px solid var(--crit); background:#221519; }"
+        ".gap-row.done { opacity:.5; }"
+        ".gap-row.done .g-title { text-decoration:line-through; }"
+        ".gap-row.k-finding.done { opacity:1; }"
+        ".gap-row.k-finding.done .g-title { text-decoration:none; }"
+        ".gap-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }"
+        ".g-title { font-weight:600; flex:1 1 260px; }"
+        ".g-check { width:16px; height:16px; flex:0 0 auto; }"
+        ".g-status { background:#1b232d; color:var(--txt); border:1px solid var(--line);"
+        "            border-radius:6px; padding:2px 6px; font-size:.78rem; }"
+        ".g-note-toggle { background:transparent; color:var(--muted); border:1px solid var(--line);"
+        "                 border-radius:6px; padding:2px 8px; font-size:.72rem; cursor:pointer; }"
+        ".gap-body { margin-top:6px; font-size:.85rem; color:var(--muted); }"
+        ".gap-body .ev, .gap-body .rec { margin-top:4px; }"
+        ".g-note { display:block; width:100%; margin-top:8px; min-height:54px; background:#0c1116;"
+        "          color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:6px;"
+        "          font-family:inherit; font-size:.82rem; resize:vertical; }"
         "code { background:#0c1116; padding:1px 5px; border-radius:4px;"
         "       font-family:Consolas,monospace; font-size:.85em; color:#ffd9a0; word-break:break-all; }"
         ".tag { display:inline-block; font-size:.7rem; font-weight:700; padding:1px 7px;"
-        "       border-radius:4px; margin-right:8px; color:#0f1419; }"
+        "       border-radius:4px; color:#0f1419; flex:0 0 auto; }"
         ".t-crit { background:var(--crit); } .t-high { background:var(--high); }"
         ".t-med { background:var(--med); } .t-low { background:var(--low); }"
         ".owasp { display:inline-block; font-size:.68rem; font-weight:600; padding:1px 7px;"
-        "         border-radius:4px; margin-right:8px; background:#243447; color:#9bd0ff; border:1px solid #355068; }"
+        "         border-radius:4px; background:#243447; color:#9bd0ff; border:1px solid #355068; flex:0 0 auto; }"
+        ".hidden { display:none; }"
         "footer { color:var(--muted); font-size:.8rem; margin-top:8px; }"
+        "@media print {"
+        "  body { background:#fff; color:#000; padding:0; }"
+        "  .toolbar, .prog-wrap, .diagram-btn, .g-note-toggle, #btn-export, #btn-reset { display:none !important; }"
+        "  .ep.collapsed .ep-body { display:block !important; }"
+        "  .diagram-wrap.hidden { display:none !important; }"
+        "  .ep, .findings, .stat, .gap-row { border-color:#bbb; background:#fff; color:#000; break-inside:avoid; }"
+        "  .gap-row.done { opacity:1; }"
+        "  .muted, .prog-text, .ep-counter, .ep h2, .sec-title { color:#222; }"
+        "  code { background:#eee; color:#000; }"
+        "  .g-note { background:#fff; color:#000; }"
+        "  .g-check, .g-status { -webkit-appearance:auto; appearance:auto; }"
+        "}"
     )
 
     head = (
         '<!DOCTYPE html>\n<html lang="en"><head>\n'
         '<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        '<title>Pentest Coverage Audit &mdash; {0}</title>\n'
-        '<style>{1}</style></head><body>\n'
-        '  <h1>Pentest Coverage Audit &mdash; {0}</h1>\n'
-        '  <div class="sub">Generated {2} &middot; sorted by coverage score (worst first) '
-        '&middot; feed <code>_audit.json</code> to the pentest-coverage-analyser skill for contextual analysis.</div>\n'
-        '  <div class="summary">\n'
-        '    <div class="stat"><div class="n">{3}</div><div class="l">Endpoints</div></div>\n'
-        '    <div class="stat"><div class="n">{4}/100</div><div class="l">Avg &middot; {5}</div></div>\n'
-        '    <div class="stat"><div class="n">{6}</div><div class="l">Total Gaps</div></div>\n'
-        '    <div class="stat"><div class="n" style="color:var(--crit)">{7}</div><div class="l">Critical</div></div>\n'
-        '    <div class="stat"><div class="n" style="color:var(--high)">{8}</div><div class="l">High</div></div>\n'
-        '  </div>\n'
-    ).format(_html_escape(engagement), css, now, total, avg, score_label(avg),
-             total_gaps, critical, high)
+        '<title>Pentest Coverage Audit &mdash; ' + _html_escape(engagement) + '</title>\n'
+        '<style>' + css + '</style></head><body>\n'
+        '  <h1>Pentest Coverage Audit &mdash; ' + _html_escape(engagement) + '</h1>\n'
+        '  <div class="sub">Generated ' + _html_escape(now) + ' &middot; interactive engagement checklist '
+        '&middot; progress (status / notes) is saved in this browser via localStorage. '
+        'Feed <code>_audit.json</code> to the pentest-coverage-analyser skill for contextual analysis.</div>\n'
+    )
+
+    summary = (
+        '  <div class="summary">'
+        '<div class="stat"><div class="n">{0}</div><div class="l">Endpoints</div></div>'
+        '<div class="stat"><div class="n">{1}/100</div><div class="l">Avg &middot; {2}</div></div>'
+        '<div class="stat"><div class="n">{3}</div><div class="l">Total Gaps</div></div>'
+        '<div class="stat"><div class="n" style="color:var(--crit)">{4}</div><div class="l">Critical</div></div>'
+        '<div class="stat"><div class="n" style="color:var(--high)">{5}</div><div class="l">High</div></div>'
+        '<div class="stat"><div class="n" style="color:var(--crit)">{6}</div><div class="l">Confirmed Findings</div></div>'
+        '<div class="stat"><div class="n" id="tile-tested">0 / 0</div><div class="l">Tested / Counted</div></div>'
+        '</div>\n'
+    ).format(total, avg, score_label(avg), total_gaps, critical, high, findings_count)
+
+    toolbar = (
+        '  <div class="toolbar" id="toolbar"><div class="tb-row">'
+        '<strong>Severity:</strong>'
+        '<label><input type="checkbox" class="sev-toggle" value="CRITICAL" checked> Crit</label>'
+        '<label><input type="checkbox" class="sev-toggle" value="HIGH" checked> High</label>'
+        '<label><input type="checkbox" class="sev-toggle" value="MEDIUM" checked> Med</label>'
+        '<label><input type="checkbox" class="sev-toggle" value="LOW" checked> Low</label>'
+        '<label>Status: <select id="f-status">'
+        '<option value="all">All</option><option value="open">Open only</option>'
+        '<option value="hidetested">Hide tested</option><option value="confirmed">Confirmed only</option>'
+        '<option value="fp">False positives</option></select></label>'
+        '<label>OWASP: <select id="f-owasp">' + owasp_opts + '</select></label>'
+        '<input type="text" id="f-text" placeholder="Filter title / evidence / fix...">'
+        '<span class="tb-spacer"></span>'
+        '<button class="btn" id="btn-export" type="button">Export progress (JSON)</button>'
+        '<button class="btn" id="btn-import" type="button">Import progress (JSON)</button>'
+        '<input type="file" id="import-file" accept="application/json,.json" class="hidden">'
+        '<button class="btn btn-danger" id="btn-reset" type="button">Reset progress</button>'
+        '</div></div>\n'
+    )
+
+    progress = (
+        '  <div class="prog-wrap"><div class="prog-bar"><div class="prog-fill" id="prog-fill"></div></div>'
+        '<span class="prog-text" id="prog-text">0 / 0 tested</span></div>\n'
+    )
+
+    # ── Client-side logic (concatenated raw; ENG injected as a JS string literal) ──
+    js_body = (
+        'var PREFIX = "covermap:" + ENG + ":";\n'
+        'function lsGet(k){ try { return window.localStorage.getItem(k); } catch(e){ return null; } }\n'
+        'function lsSet(k,v){ try { window.localStorage.setItem(k,v); } catch(e){} }\n'
+        'function lsDel(k){ try { window.localStorage.removeItem(k); } catch(e){} }\n'
+        'function noteKey(row){ return PREFIX + row.getAttribute("data-gid") + ":note"; }\n'
+        'function isExcluded(s){ return s==="False Positive" || s==="N/A"; }\n'
+        'function isDone(chk,s){ return !isExcluded(s) && (chk || s==="Tested" || s==="Confirmed Finding"); }\n'
+        'function loadRow(row){\n'
+        '  var sel=row.querySelector(".g-status"), chk=row.querySelector(".g-check");\n'
+        '  var status=row.getAttribute("data-default-status")||"Open", checked=false;\n'
+        '  var raw=lsGet(PREFIX+row.getAttribute("data-gid"));\n'
+        '  if(raw){ try { var o=JSON.parse(raw); if(o){ if(o.status) status=o.status; checked=!!o.checked; } } catch(e){} }\n'
+        '  sel.value=status; chk.checked=checked;\n'
+        '  var nt=row.querySelector(".g-note"), nv=lsGet(noteKey(row)); if(nv!=null) nt.value=nv;\n'
+        '  paintRow(row);\n'
+        '}\n'
+        'function saveRow(row){\n'
+        '  lsSet(PREFIX+row.getAttribute("data-gid"), JSON.stringify({\n'
+        '    status: row.querySelector(".g-status").value,\n'
+        '    checked: row.querySelector(".g-check").checked }));\n'
+        '}\n'
+        'function paintRow(row){\n'
+        '  var chk=row.querySelector(".g-check").checked, status=row.querySelector(".g-status").value;\n'
+        '  row.classList.toggle("done", isDone(chk,status));\n'
+        '}\n'
+        'function syncFromCheck(row){\n'
+        '  var chk=row.querySelector(".g-check").checked, sel=row.querySelector(".g-status");\n'
+        '  if(chk && (sel.value==="Open"||sel.value==="In Progress")) sel.value="Tested";\n'
+        '  if(!chk && sel.value==="Tested") sel.value="Open";\n'
+        '}\n'
+        'function syncFromStatus(row){\n'
+        '  var sel=row.querySelector(".g-status").value, chk=row.querySelector(".g-check");\n'
+        '  if(sel==="Tested"||sel==="Confirmed Finding"||sel==="False Positive"||sel==="N/A") chk.checked=true;\n'
+        '  if(sel==="Open"||sel==="In Progress") chk.checked=false;\n'
+        '}\n'
+        'function countRows(rows){\n'
+        '  var counted=0, done=0;\n'
+        '  rows.forEach(function(row){\n'
+        '    var chk=row.querySelector(".g-check").checked, status=row.querySelector(".g-status").value;\n'
+        '    if(!isExcluded(status)){ counted++; if(isDone(chk,status)) done++; }\n'
+        '  });\n'
+        '  return [done,counted];\n'
+        '}\n'
+        'function updateProgress(){\n'
+        '  var all=Array.prototype.slice.call(document.querySelectorAll(".gap-row"));\n'
+        '  var r=countRows(all), done=r[0], counted=r[1];\n'
+        '  var pct=counted? Math.round(done*100/counted):0;\n'
+        '  document.getElementById("prog-fill").style.width=pct+"%";\n'
+        '  document.getElementById("prog-text").textContent=done+" / "+counted+" tested ("+pct+"%)";\n'
+        '  document.getElementById("tile-tested").textContent=done+" / "+counted;\n'
+        '  document.querySelectorAll(".ep").forEach(function(card){\n'
+        '    var cr=Array.prototype.slice.call(card.querySelectorAll(".gap-row"));\n'
+        '    var x=countRows(cr); var el=card.querySelector(".ep-counter");\n'
+        '    if(el) el.textContent=x[0]+"/"+x[1]+" tested";\n'
+        '  });\n'
+        '}\n'
+        'function applyFilters(){\n'
+        '  var sevOn={}; document.querySelectorAll(".sev-toggle").forEach(function(cb){ sevOn[cb.value]=cb.checked; });\n'
+        '  var sf=document.getElementById("f-status").value;\n'
+        '  var of=document.getElementById("f-owasp").value;\n'
+        '  var q=document.getElementById("f-text").value.toLowerCase().trim();\n'
+        '  document.querySelectorAll(".gap-row").forEach(function(row){\n'
+        '    var sev=row.getAttribute("data-sev");\n'
+        '    var status=row.querySelector(".g-status").value, chk=row.querySelector(".g-check").checked;\n'
+        '    var owasp=row.getAttribute("data-owasp")||"", text=row.getAttribute("data-search")||"";\n'
+        '    var vis=true;\n'
+        '    if(sev && sevOn[sev]===false) vis=false;\n'
+        '    if(of!=="__all__" && owasp!==of) vis=false;\n'
+        '    if(q && text.indexOf(q)<0) vis=false;\n'
+        '    if(sf==="open" && !(status==="Open"||status==="In Progress")) vis=false;\n'
+        '    if(sf==="hidetested" && isDone(chk,status)) vis=false;\n'
+        '    if(sf==="confirmed" && status!=="Confirmed Finding") vis=false;\n'
+        '    if(sf==="fp" && status!=="False Positive") vis=false;\n'
+        '    row.style.display=vis?"":"none";\n'
+        '  });\n'
+        '  document.querySelectorAll(".ep").forEach(function(card){\n'
+        '    var any=Array.prototype.some.call(card.querySelectorAll(".gap-row"), function(r){ return r.style.display!=="none"; });\n'
+        '    var hasRows=card.querySelectorAll(".gap-row").length>0;\n'
+        '    card.style.display=(!hasRows||any)?"":"none";\n'
+        '  });\n'
+        '  var fsec=document.getElementById("findings-sec");\n'
+        '  if(fsec){\n'
+        '    var anyf=Array.prototype.some.call(fsec.querySelectorAll(".gap-row"), function(r){ return r.style.display!=="none"; });\n'
+        '    fsec.style.display=anyf?"":"none";\n'
+        '  }\n'
+        '}\n'
+        'function exportProgress(){\n'
+        '  var map={};\n'
+        '  document.querySelectorAll(".gap-row").forEach(function(row){\n'
+        '    map[row.getAttribute("data-gid")]={ status:row.querySelector(".g-status").value,\n'
+        '      checked:row.querySelector(".g-check").checked, note:row.querySelector(".g-note").value };\n'
+        '  });\n'
+        '  var blob=new Blob([JSON.stringify(map,null,2)], {type:"application/json"});\n'
+        '  var a=document.createElement("a");\n'
+        '  a.href=URL.createObjectURL(blob);\n'
+        '  a.download="covermap_progress_"+ENG.replace(/[^A-Za-z0-9_.-]/g,"_")+".json";\n'
+        '  document.body.appendChild(a); a.click(); document.body.removeChild(a);\n'
+        '}\n'
+        'function resetProgress(){\n'
+        '  if(!confirm("Clear all saved progress for this report ("+ENG+")? This cannot be undone.")) return;\n'
+        '  var keys=[];\n'
+        '  for(var i=0;i<window.localStorage.length;i++){ var k=window.localStorage.key(i); if(k && k.indexOf(PREFIX)===0) keys.push(k); }\n'
+        '  keys.forEach(lsDel); location.reload();\n'
+        '}\n'
+        'function importProgress(file){\n'
+        '  if(!file) return;\n'
+        '  var reader=new FileReader();\n'
+        '  reader.onload=function(){\n'
+        '    var map; try { map=JSON.parse(reader.result); } catch(e){ alert("Not valid JSON: "+e); return; }\n'
+        '    if(!map || typeof map!=="object"){ alert("Unexpected file format (expected a {gid:{status,checked,note}} map)."); return; }\n'
+        '    var known={}; document.querySelectorAll(".gap-row").forEach(function(row){ known[row.getAttribute("data-gid")]=1; });\n'
+        '    var applied=0, unknown=0;\n'
+        '    Object.keys(map).forEach(function(gid){\n'
+        '      var v=map[gid]||{};\n'
+        '      lsSet(PREFIX+gid, JSON.stringify({ status:(v.status||"Open"), checked:!!v.checked }));\n'
+        '      if(typeof v.note==="string" && v.note.length) lsSet(PREFIX+gid+":note", v.note);\n'
+        '      if(known[gid]) applied++; else unknown++;\n'
+        '    });\n'
+        '    alert("Imported progress for "+Object.keys(map).length+" gap(s): "+applied+" match this report, "+unknown+" not present here (kept for re-runs). Reloading.");\n'
+        '    location.reload();\n'
+        '  };\n'
+        '  reader.onerror=function(){ alert("Could not read file."); };\n'
+        '  reader.readAsText(file);\n'
+        '}\n'
+        'function toggleDiagram(card){\n'
+        '  var wrap=card.querySelector(".diagram-wrap"); if(!wrap) return;\n'
+        '  var hidden=wrap.classList.toggle("hidden");\n'
+        '  if(!hidden && wrap.getAttribute("data-rendered")!=="1"){\n'
+        '    try { mermaid.run({ nodes:[wrap.querySelector(".mermaid")] }); } catch(e){}\n'
+        '    wrap.setAttribute("data-rendered","1");\n'
+        '  }\n'
+        '}\n'
+        'document.addEventListener("DOMContentLoaded", function(){\n'
+        '  try { mermaid.initialize({ startOnLoad:false, theme:"dark", securityLevel:"loose" }); } catch(e){}\n'
+        '  document.querySelectorAll(".gap-row").forEach(function(row){\n'
+        '    loadRow(row);\n'
+        '    row.querySelector(".g-check").addEventListener("change", function(){ syncFromCheck(row); saveRow(row); paintRow(row); updateProgress(); applyFilters(); });\n'
+        '    row.querySelector(".g-status").addEventListener("change", function(){ syncFromStatus(row); saveRow(row); paintRow(row); updateProgress(); applyFilters(); });\n'
+        '    var nt=row.querySelector(".g-note");\n'
+        '    nt.addEventListener("input", function(){ lsSet(noteKey(row), nt.value); });\n'
+        '    row.querySelector(".g-note-toggle").addEventListener("click", function(){ nt.classList.toggle("hidden"); });\n'
+        '  });\n'
+        '  document.querySelectorAll(".ep-head").forEach(function(h){\n'
+        '    h.addEventListener("click", function(e){ if(e.target.classList.contains("diagram-btn")) return; h.parentNode.classList.toggle("collapsed"); });\n'
+        '  });\n'
+        '  document.querySelectorAll(".diagram-btn").forEach(function(b){\n'
+        '    b.addEventListener("click", function(e){ e.stopPropagation(); toggleDiagram(b.closest(".ep")); });\n'
+        '  });\n'
+        '  document.querySelectorAll(".sev-toggle").forEach(function(cb){ cb.addEventListener("change", applyFilters); });\n'
+        '  document.getElementById("f-status").addEventListener("change", applyFilters);\n'
+        '  document.getElementById("f-owasp").addEventListener("change", applyFilters);\n'
+        '  document.getElementById("f-text").addEventListener("input", applyFilters);\n'
+        '  document.getElementById("btn-export").addEventListener("click", exportProgress);\n'
+        '  var impFile=document.getElementById("import-file");\n'
+        '  document.getElementById("btn-import").addEventListener("click", function(){ impFile.value=""; impFile.click(); });\n'
+        '  impFile.addEventListener("change", function(){ importProgress(impFile.files && impFile.files[0]); });\n'
+        '  document.getElementById("btn-reset").addEventListener("click", resetProgress);\n'
+        '  updateProgress(); applyFilters();\n'
+        '});\n'
+    )
+    js = 'var ENG = ' + json.dumps(engagement) + ';\n' + js_body
 
     tail = (
-        '\n  <footer>Mermaid diagrams load from a CDN (internet needed on first open; '
-        'text/gap lists render regardless).</footer>\n'
+        '  <footer>Progress is stored only in this browser (localStorage, no server). '
+        'Use &ldquo;Export progress&rdquo; for a portable copy; &ldquo;Reset progress&rdquo; clears it. '
+        'Mermaid diagrams load from a CDN on first expand.</footer>\n'
         '  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>\n'
-        '  <script>mermaid.initialize({ startOnLoad: true });</script>\n'
+        '  <script>\n' + js + '  </script>\n'
         '</body></html>'
     )
-    return head + ''.join(cards) + tail
+    return head + summary + toolbar + progress + findings_html + "".join(cards) + tail
 
 
 _SEV_ORDER = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3}
@@ -2209,13 +3421,15 @@ def write_text_file(filepath, content):
 # ============================================================
 
 def run_pipeline(input_files, scope_csv, engagement, output_base_dir,
-                 formats, keep_static, keep_noise, exclude_path_csv, logger):
+                 formats, keep_static, keep_noise, exclude_path_csv, logger,
+                 strict=False):
     """
     input_files: list of (filepath, fmt) tuples - fmt is 'csv' or 'json'
     scope_csv: comma-separated scope string
     engagement: engagement name
     output_base_dir: base directory (output files go in a scope-named subdir)
     formats: dict of {'html': bool, 'json': bool, 'txt': bool, 'markdown': bool}
+    strict: when True, log each dropped row on parse failure (else just count)
     Returns: output directory path
     """
     scope_list = [s.strip() for s in scope_csv.split(',') if s.strip()] if scope_csv else []
@@ -2230,7 +3444,7 @@ def run_pipeline(input_files, scope_csv, engagement, output_base_dir,
                               filter_static=not keep_static,
                               scope=scope_list if scope_list else None,
                               exclude_paths=exclude_list,
-                              logger=logger)
+                              logger=logger, strict=strict)
         logger("  -> {0} requests after filters".format(len(reqs)))
         all_requests.extend(reqs)
 
@@ -2383,6 +3597,10 @@ if BURP_AVAILABLE:
             self._cb_md = JCheckBox("Markdown", False)
             self._cb_keep_static = JCheckBox("Keep static assets (.js/.css/img)", False)
             self._cb_keep_noise = JCheckBox("Keep noise paths (CDN/telemetry)", False)
+            self._cb_strict = JCheckBox("Strict (log dropped rows)", False)
+            self._cb_strict.setToolTipText(
+                "On a parse failure, log the offending row instead of silently dropping it. "
+                "A dropped-row count is always reported regardless of this setting.")
 
             fmt_panel = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
             fmt_panel.add(JLabel("Output formats:"))
@@ -2395,6 +3613,7 @@ if BURP_AVAILABLE:
             flt_panel = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
             flt_panel.add(self._cb_keep_static)
             flt_panel.add(self._cb_keep_noise)
+            flt_panel.add(self._cb_strict)
             add_row(5, "", flt_panel)
 
             # Buttons row: Upload CSV / Upload JSON / Clear / Run
@@ -2542,6 +3761,7 @@ if BURP_AVAILABLE:
             files_snapshot = list(self._uploaded_files)
             keep_static = self._cb_keep_static.isSelected()
             keep_noise = self._cb_keep_noise.isSelected()
+            strict = self._cb_strict.isSelected()
 
             ext = self
 
@@ -2553,7 +3773,8 @@ if BURP_AVAILABLE:
                         ext._log("Run starting | scope='{0}' | engagement='{1}'".format(scope, engagement))
                         out_dir = run_pipeline(
                             files_snapshot, scope, engagement, out_base,
-                            formats, keep_static, keep_noise, exclude, ext._log)
+                            formats, keep_static, keep_noise, exclude, ext._log,
+                            strict=strict)
                         ext._last_output_dir = out_dir
                         ext._log("DONE. Reports in: {0}".format(out_dir))
                     except Exception:
