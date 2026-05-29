@@ -291,6 +291,18 @@ class EndpointProfile(object):
         self.total_requests = 0
         self.behavior_class = 'unknown'
         self.sample_requests = []
+        # ── Per-request STRUCTURAL tracking (enables retest intelligence) ──
+        # Aggregating param values into sets loses per-request structure, so
+        # field-removal, duplicate-key (HPP) and array-binding tests become
+        # invisible. These counters preserve that structure so re-running
+        # CoverMap after a structural retest reduces the gap.
+        self.body_param_presence = {}    # body param name -> # of body-submitting requests containing it
+        self.query_param_presence = {}   # query param name -> # of query-bearing requests containing it
+        self.body_submit_count = 0       # requests that submitted >=1 body param (form posts)
+        self.query_bearing_count = 0     # requests that carried >=1 query param
+        self.hpp_params = set()          # params sent with >1 value in a SINGLE request (HPP/array)
+        self.array_params = set()        # params whose name uses [] array notation
+        self.empty_value_params = set()  # params observed with an empty ('') value
 
 
 class EndpointAudit(object):
@@ -524,6 +536,55 @@ def _normalise_path(path):
     return path
 
 
+# Characters that never appear in a legitimate HTTP parameter NAME but do appear
+# when an injected scan payload (containing & ; spaces $() ` etc.) is parsed by
+# parse_qs and shredded into bogus "parameters". ASP.NET joiners ($ . [ ] : -)
+# and word chars are allowed; whitespace, quotes, backslash and shell
+# metacharacters are not.
+_JUNK_PARAM_NAME = re.compile(r'[\s;|`<>(){}\'"\\]')
+# Bare shell-command words that show up as param fragments from CMDi payloads
+# (e.g. `;whoami`, `&id`). Only treated as junk when their value is empty, so a
+# genuine `id=123` parameter is preserved.
+_CMD_WORD_PARAMS = set([
+    'whoami', 'id', 'ls', 'dir', 'cat', 'pwd', 'uname', 'ping', 'nslookup',
+    'sleep', 'curl', 'wget', 'ifconfig', 'ipconfig', 'hostname', 'netstat',
+    'net', 'ps', 'env', 'type', 'more', 'cmd', 'bash', 'sh', 'powershell',
+    'echo', 'systeminfo', 'dig', 'host', 'traceroute', 'tracert',
+])
+_INJECTION_NAME_FRAGMENT = (
+    '../', '..\\', '<script', 'etc/passwd', 'union select', 'or 1=1',
+    '%0a', '%0d', 'waitfor delay', 'php://', 'file://', '169.254',
+)
+
+
+def _is_payload_fragment_param(name, values):
+    """True if a parsed 'parameter' is actually a fragment of an injected scan
+    payload (split out of a value by & / ; / whitespace), not a real app input.
+    Filtering these removes the false positives a pentester sees after running
+    an injection scan and then re-running CoverMap on the captured traffic."""
+    n = str(name)
+    if _JUNK_PARAM_NAME.search(n):          # whitespace / shell metachars / quotes / backslash
+        return True
+    nl = n.strip().lower()
+    if nl in _CMD_WORD_PARAMS:
+        if all((v is None or str(v).strip() == '') for v in values):
+            return True
+    for frag in _INJECTION_NAME_FRAGMENT:
+        if frag in nl:
+            return True
+    return False
+
+
+def _filter_payload_fragments(params):
+    """Drop payload-fragment entries from a parsed {name: [values]} dict."""
+    out = {}
+    for k, v in params.items():
+        if _is_payload_fragment_param(k, v):
+            continue
+        out[k] = v
+    return out
+
+
 # ============================================================
 # PROFILER
 # ============================================================
@@ -542,6 +603,13 @@ def build_profiles(requests):
         except Exception:
             qparams = {}
 
+        # Strip payload-fragment "parameters" created when injected scan payloads
+        # (containing & ; whitespace $() etc.) are split by parse_qs. Without this,
+        # a CMDi/SQLi scan run produces dozens of bogus params like `whoami`,
+        # `sleep 5`, `nslookup $(whoami).collab` -> false-positive gaps.
+        bparams = _filter_payload_fragments(bparams)
+        qparams = _filter_payload_fragments(qparams)
+
         if eid not in profiles:
             profiles[eid] = EndpointProfile(host=req['host'], path=path, endpoint_id=eid)
         p = profiles[eid]
@@ -550,10 +618,30 @@ def build_profiles(requests):
         p.status_codes_seen.add(req['status'])
         p.response_lengths.append(req['resp_len'])
 
-        for param, vals in qparams.items():
-            p.query_params.setdefault(param, set()).update(vals)
+        # Per-request structural bookkeeping (presence, HPP, array, empty).
+        if bparams:
+            p.body_submit_count += 1
         for param, vals in bparams.items():
             p.body_params.setdefault(param, set()).update(vals)
+            p.body_param_presence[param] = p.body_param_presence.get(param, 0) + 1
+            if len(vals) > 1:                       # same key sent twice in ONE request -> HPP/array
+                p.hpp_params.add(param)
+            if '[]' in str(param):
+                p.array_params.add(param)
+            if any((v is None or str(v) == '') for v in vals):
+                p.empty_value_params.add(param)
+
+        if qparams:
+            p.query_bearing_count += 1
+        for param, vals in qparams.items():
+            p.query_params.setdefault(param, set()).update(vals)
+            p.query_param_presence[param] = p.query_param_presence.get(param, 0) + 1
+            if len(vals) > 1:
+                p.hpp_params.add(param)
+            if '[]' in str(param):
+                p.array_params.add(param)
+            if any((v is None or str(v) == '') for v in vals):
+                p.empty_value_params.add(param)
 
         any_auth = False
         for h in hdrs:
@@ -583,9 +671,43 @@ def build_profiles(requests):
     return profiles
 
 
+# Attack-payload signatures used to detect that an endpoint is being ACTIVELY
+# tested (not merely browsed). If any tested value carries one of these, the
+# endpoint is at least Repeater-class regardless of the param-count heuristic.
+ATTACK_VALUE_SIGS = (
+    "'", '"', '--', '/*', 'or 1=1', "or '1'='1", 'union', 'sleep', 'waitfor',
+    '<script', '<svg', '<img', 'onerror', 'onload', 'onfocus', 'javascript:', 'alert(',
+    '${', '{{', '#{', '<%=', '$ne', '$gt', '$regex', '{$',
+    '../', '..\\', '%2e', '/etc/passwd', 'win.ini', 'php://',
+    '169.254', '127.0.0.1', 'localhost', 'file://', 'gopher://', 'metadata',
+    '%0d', '%0a', '*)(', '|(uid=',
+)
+
+
+def _has_attack_evidence(p):
+    """True if the endpoint shows signs of active security testing:
+    attack-signature values, duplicate-key/array params, or field removal.
+    Used so an actively-tested endpoint is never mislabelled 'browse'."""
+    if p.hpp_params or p.array_params or p.empty_value_params:
+        return True
+    if _detect_removed_params(p):
+        return True
+    for d in (p.query_params, p.body_params):
+        for k, vals in d.items():
+            if str(k).strip().lower() in FRAMEWORK_PARAMS:
+                continue
+            for v in vals:
+                lv = str(v).lower()
+                for s in ATTACK_VALUE_SIGS:
+                    if s in lv:
+                        return True
+    return False
+
+
 def _classify(p):
     if p.total_requests == 1:
-        return 'single'
+        # Even a single request can be an active test if it carries a payload.
+        return 'repeater' if _has_attack_evidence(p) else 'single'
     unique_len = len(set(p.response_lengths))
     unique_stat = len(p.status_codes_seen)
     all_params = {}
@@ -596,6 +718,10 @@ def _classify(p):
         biggest = max([len(v) for v in all_params.values()] + [0])
         if biggest > 20:
             return 'intruder'
+    # Active-testing evidence => Repeater-class (being deliberately exercised),
+    # regardless of the fragile param_var > total_requests count heuristic.
+    if _has_attack_evidence(p):
+        return 'repeater'
     if p.total_requests >= 3 and (unique_stat > 1 or unique_len > 2 or param_var > p.total_requests):
         return 'repeater'
     return 'browse'
@@ -605,8 +731,36 @@ def _classify(p):
 # GAP ANALYSIS
 # ============================================================
 
+ASPNET_NOISE_TOKEN = re.compile(
+    r'^(ctl\d+|ContentPlaceHolder\d*|PlaceHolder\d*|MainContent|MasterPage|'
+    r'WebUserControl\d*|FormView\d*|wuc\w*|MasterContent)$', re.I)
+ASPNET_CONTROL_PREFIX = re.compile(
+    r'^(txt|btn|lbl|ddl|cb|chk|rb|hdn|lnk|pnl|gv|img|lv|fv|hf|wv|tbl|usr)([A-Z]\w*)$')
+
+
 def _norm_param(name):
+    """Normalise a parameter name for keyword classification.
+
+    Splits on `$ _ . - [ ]`, drops ASP.NET framework noise tokens
+    (ctl00, ContentPlaceHolder1, MasterPage, ...), strips ASP.NET
+    control-name prefixes (txtEmail -> Email), then camelCase-splits.
+    The original parameter name is still used for display in gaps -
+    this normalisation only affects which regex classifiers match it,
+    which kills a large class of false positives where framework
+    wrapper words like 'Content' or 'Master' were matching real
+    keywords like 'content' (file-upload) or 'master' (admin).
+    """
     s = re.sub(r'[$_.\-\[\]]+', ' ', str(name))
+    tokens = s.split()
+    cleaned = []
+    for t in tokens:
+        if ASPNET_NOISE_TOKEN.match(t):
+            continue
+        m = ASPNET_CONTROL_PREFIX.match(t)
+        if m:
+            t = m.group(2)
+        cleaned.append(t)
+    s = ' '.join(cleaned) if cleaned else s
     s = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', s)
     s = re.sub(r'(?<=[A-Za-z])(?=[0-9])', ' ', s)
     return s
@@ -734,8 +888,179 @@ def _has_sig(values, sigs):
     return False
 
 
+# ─────────────────────────────────────────────────────────────────
+# RETEST-DETECTION HELPERS
+# These detect EVIDENCE that the user already performed a given
+# class of test, so the corresponding "X not tested" gap can be
+# suppressed on re-runs. This is what makes the score reduce when
+# the user adds more test cases and re-runs CoverMap.
+# ─────────────────────────────────────────────────────────────────
+
+_LOGIN_FIELD_RE = re.compile(r'(user|email|login|signin|signon|account|uid|userid|loginid|cred)', re.I)
+_PWD_FIELD_RE   = re.compile(r'(pass|pwd|secret|passwd)', re.I)
+_OTP_FIELD_RE   = re.compile(r'(otp|code|2fa|mfa|verif|challenge|totp)', re.I)
+_RESET_FIELD_RE = re.compile(r'(token|reset|code|nonce|key)', re.I)
+_PRIV_KEY_RE    = re.compile(
+    r'\b(is_?admin|admin|role|roles|verified|approved|active|enabled|'
+    r'balance|credit|permission|grant|tier|plan|status|account_?type|user_?type|level)\b', re.I)
+
+SQLI_AUTH_SIGS = ("'", '"', '--', '/*', 'or 1=1', "or '1'='1", 'union select', 'sleep(', 'waitfor delay', 'admin\'--')
+NOSQL_AUTH_SIGS = ('$ne', '$gt', '$lt', '$regex', '"$ne"', '[$ne]', '[$gt]')
+LDAP_AUTH_SIGS = ('*)(', '*)', '|(uid=', '|(cn=', 'admin)(&', '&(uid=')
+
+STRUCT_EMPTY = ('',)
+STRUCT_NULL = ('null', 'none', '"null"', "'null'")
+STRUCT_BOOL = ('true', 'false', '"true"', '"false"')
+STRUCT_TYPECONFUSION = ('[]', '{}', '["a","b"]', '{"$ne":null}')
+
+
+def _values_for(all_params, name_regex):
+    """Collect every tested value for params whose normalised name matches name_regex."""
+    out = []
+    for k, vals in all_params.items():
+        if str(k).strip().lower() in FRAMEWORK_PARAMS:
+            continue
+        if name_regex.search(_norm_param(k)):
+            out.extend(list(vals))
+    return [str(v).lower() for v in out]
+
+
+def _detect_removed_params(p):
+    """Param names omitted in at least one relevant request - evidence the
+    pentester removed/dropped the field during a retest.
+
+    Body params are compared only against requests that submitted a body
+    (so a GET page-load doesn't look like 'every field was removed'); query
+    params against query-bearing requests. Framework plumbing is ignored.
+    Requires >=2 comparable requests so a single capture isn't misread."""
+    removed = set()
+    if p.body_submit_count >= 2:
+        for param, cnt in p.body_param_presence.items():
+            if str(param).strip().lower() in FRAMEWORK_PARAMS:
+                continue
+            if cnt < p.body_submit_count:
+                removed.add(param)
+    if p.query_bearing_count >= 2:
+        for param, cnt in p.query_param_presence.items():
+            if str(param).strip().lower() in FRAMEWORK_PARAMS:
+                continue
+            if cnt < p.query_bearing_count:
+                removed.add(param)
+    return removed
+
+
+def _structural_signals(p, name_regex=None):
+    """Structural test categories with observed evidence on this endpoint,
+    optionally restricted to params whose normalised name matches name_regex.
+    Categories: 'removed', 'empty', 'hpp', 'array'."""
+    sig = set()
+    def _match(k):
+        if name_regex is None:
+            return str(k).strip().lower() not in FRAMEWORK_PARAMS
+        return bool(name_regex.search(_norm_param(k)))
+
+    removed = _detect_removed_params(p)
+    if any(_match(k) for k in removed):
+        sig.add('removed')
+    if any(_match(k) for k in p.empty_value_params):
+        sig.add('empty')
+    if any(_match(k) for k in p.hpp_params):
+        sig.add('hpp')
+    if any(_match(k) for k in p.array_params):
+        sig.add('array')
+    return sig
+
+
+def _detect_auth_testing(p, all_params):
+    """Categories of testing observed on a login/reset/register/otp endpoint."""
+    tested = set()
+
+    user_vals = _values_for(all_params, _LOGIN_FIELD_RE)
+    pwd_vals  = _values_for(all_params, _PWD_FIELD_RE)
+    otp_vals  = _values_for(all_params, _OTP_FIELD_RE)
+    rst_vals  = _values_for(all_params, _RESET_FIELD_RE)
+    combined  = user_vals + pwd_vals + otp_vals + rst_vals
+    if not combined:
+        # No obvious named fields - fall back to all non-framework param values
+        for k, vals in all_params.items():
+            if str(k).strip().lower() in FRAMEWORK_PARAMS:
+                continue
+            combined.extend(str(v).lower() for v in vals)
+
+    if any(s in v for s in SQLI_AUTH_SIGS for v in combined):
+        tested.add('sqli')
+    if any(s in v for s in NOSQL_AUTH_SIGS for v in combined):
+        tested.add('nosql')
+    if any(s in v for s in LDAP_AUTH_SIGS for v in combined):
+        tested.add('ldap')
+    if any(v == '' for v in combined):
+        tested.add('empty')
+    if any(v in STRUCT_NULL for v in combined):
+        tested.add('null')
+    if any(v in STRUCT_BOOL for v in combined):
+        tested.add('bool')
+    if any(v in STRUCT_TYPECONFUSION for v in combined):
+        tested.add('typeconfusion')
+    if p.total_requests >= 20:
+        tested.add('brute_volume')
+    # Per-field fuzzing signal: 4+ distinct values on any candidate field
+    for k, vals in all_params.items():
+        if str(k).strip().lower() in FRAMEWORK_PARAMS:
+            continue
+        nm = _norm_param(k)
+        if (_LOGIN_FIELD_RE.search(nm) or _PWD_FIELD_RE.search(nm) or
+                _OTP_FIELD_RE.search(nm) or _RESET_FIELD_RE.search(nm)):
+            if len(set(vals)) >= 4:
+                tested.add('field_fuzzed')
+                break
+
+    # ── Structural tests (field removal / empty / HPP / array) on auth fields ──
+    # This is what credits "I removed the password field on retest". The
+    # combined regex covers username/email/uid + password + otp/code + token.
+    auth_field_re = re.compile(
+        r'(user|email|login|signin|signon|account|uid|userid|cred|'
+        r'pass|pwd|secret|otp|code|2fa|mfa|verif|challenge|totp|token|reset|nonce)', re.I)
+    struct = _structural_signals(p, auth_field_re)
+    if 'removed' in struct:
+        tested.add('removed')
+    if 'empty' in struct:
+        tested.add('empty')
+    if 'hpp' in struct or 'array' in struct:
+        tested.add('typeconfusion')   # duplicate-key / array bind is a type/structure test
+    return tested
+
+
+def _detect_mass_assign_tested(p):
+    """Did the user inject privilege/state keys into the body?"""
+    for k in p.body_params:
+        if str(k).strip().lower() in FRAMEWORK_PARAMS:
+            continue
+        if _PRIV_KEY_RE.search(_norm_param(k)):
+            return True
+    return False
+
+
+def _detect_header_spoofing_tested(p):
+    return bool(p.headers_modified & set([
+        'x-forwarded-for', 'x-forwarded-host', 'x-real-ip',
+        'x-original-url', 'x-rewrite-url', 'x-custom-ip-authorization',
+    ]))
+
+
+def _detect_method_override_tested(p):
+    return bool(p.headers_modified & set([
+        'x-http-method-override', 'x-original-url', 'x-rewrite-url',
+    ]))
+
+
+def _detect_cors_tested(p):
+    # If Origin header was modified across multiple requests, treat as tested.
+    return 'origin' in p.headers_modified
+
+
 def _heuristics(p):
     gaps = []
+    credits = [0]   # count of test-classes proven exercised (drives the score up on retest)
     all_params = {}
     all_params.update(p.query_params)
     all_params.update(p.body_params)
@@ -754,6 +1079,9 @@ def _heuristics(p):
 
     def g(cat, sev, title, detail, evidence, rec, owasp='', kind='test'):
         gaps.append(Gap(ep, cat, sev, title, detail, evidence, rec, owasp, kind))
+
+    def credit(n=1):
+        credits[0] += n
 
     # A01: BROKEN ACCESS CONTROL - skipped for pre-login forms (they are
     # unauthenticated by design; flagging "no anonymous test" on a login page
@@ -785,13 +1113,18 @@ def _heuristics(p):
               '(skip the UI gate). Tamper UI-only flags. Check sibling pages (UserList/UserRegistration/etc.).',
               'A01:2021 Broken Access Control')
 
-    g('access', 'MEDIUM',
-      'HTTP method / verb-tampering bypass not tested',
-      'Access control may key on method; override headers may bypass it.',
-      'methods seen: {0}'.format(sorted(p.methods_seen)),
-      'Try X-HTTP-Method-Override: GET/PUT, X-Original-URL, X-Rewrite-URL, lowercase/unknown verbs, '
-      'and trailing path tricks (/admin/..;/, %2e, //, .json).',
-      'A01:2021 Broken Access Control')
+    if not _detect_method_override_tested(p):
+        g('access', 'MEDIUM',
+          'HTTP method / verb-tampering bypass not tested',
+          'Access control may key on method; override headers may bypass it. '
+          '(Heuristic: no method-override header (X-HTTP-Method-Override / X-Original-URL / '
+          'X-Rewrite-URL) observed in captured traffic.)',
+          'methods seen: {0}'.format(sorted(p.methods_seen)),
+          'Try X-HTTP-Method-Override: GET/PUT, X-Original-URL, X-Rewrite-URL, lowercase/unknown verbs, '
+          'and trailing path tricks (/admin/..;/, %2e, //, .json).',
+          'A01:2021 Broken Access Control')
+    else:
+        credit()
 
     # A02: SENSITIVE DATA EXPOSURE
     leaky = [k for k in q_names if SENSITIVE_IN_URL.search(_norm_param(k))]
@@ -804,12 +1137,23 @@ def _heuristics(p):
           'A02:2021 Cryptographic Failures')
 
     # A03: INJECTION + per-param coverage
+    removed_params = _detect_removed_params(p)   # computed once for the whole endpoint
     for param, values in all_params.items():
         if str(param).strip().lower() in FRAMEWORK_PARAMS:
             continue
         vals = list(values)
         ev = "{0}={1}".format(param, vals[:3])
         np = _norm_param(param)
+        # Per-param structural evidence (field removal / empty / HPP / array).
+        param_struct = set()
+        if param in removed_params:
+            param_struct.add('removed')
+        if param in p.empty_value_params:
+            param_struct.add('empty')
+        if param in p.hpp_params:
+            param_struct.add('hpp')
+        if param in p.array_params:
+            param_struct.add('array')
 
         if INJECTION_PARAM.search(np) or IDOR_PARAM.search(np):
             if not _has_sig(values, ("'", '"', '--', ';', '/*', 'or 1=1', 'union', 'sleep', 'waitfor', '`')):
@@ -853,14 +1197,29 @@ def _heuristics(p):
               "Test `%0d%0aSet-Cookie:x=1`, `%0d%0aLocation:https://evil`, response-splitting -> XSS/cache.",
               'A03:2021 Injection')
 
-        untested = [(cls, pl) for (cls, sigs, pl) in PARAM_ATTACK_MATRIX if not _has_sig(values, sigs)]
+        # A class counts as exercised if its payload signature appears in a
+        # tested value OR (for Overflow/Type) structural evidence exists for
+        # this param (removal / empty / HPP / array). This is what lets a
+        # structural retest reduce the per-parameter gap on the next run.
+        untested = []
+        for (cls, sigs, pl) in PARAM_ATTACK_MATRIX:
+            if _has_sig(values, sigs):
+                credit()
+                continue
+            if cls == 'Overflow/Type' and param_struct:
+                credit()
+                continue
+            untested.append((cls, pl))
         if untested:
             classes = ", ".join(c for c, _pl in untested)
             payloads = "  ||  ".join("{0}: {1}".format(c, pl) for c, pl in untested)
+            struct_note = ""
+            if param_struct:
+                struct_note = " Structural tests already seen: {0}.".format(", ".join(sorted(param_struct)))
             g('param', 'HIGH' if state_changing else 'MEDIUM',
               'Custom parameter `{0}` not fuzzed for: {1}'.format(param, classes),
               '`{0}` is a user-controllable input. No attack-class signatures seen in tested values, '
-              'so these classes were never exercised on it.'.format(param),
+              'so these classes were never exercised on it.{1}'.format(param, struct_note),
               ev,
               'Fuzz `{0}` with each: {1}. '.format(param, payloads) + WAF_BYPASS,
               'A03:2021 Injection')
@@ -885,12 +1244,16 @@ def _heuristics(p):
             body_has_mass = True
             break
     if 'api' in fn or body_has_mass or state_changing:
-        g('integrity', 'HIGH', 'Mass assignment / parameter pollution not tested',
-          'Write endpoint may bind unexpected fields (privilege/balance/state).',
-          'body params: {0}'.format(list(p.body_params)[:8]),
-          'Add `role=admin`, `is_admin=true`, `verified=true`, `balance=999999`, `id=<other>` to the body. '
-          'Try JSON & form; duplicate keys (HPP); array/object wrapping `user[role]=admin`.',
-          'A08:2021 Software & Data Integrity Failures')
+        if not _detect_mass_assign_tested(p):
+            g('integrity', 'HIGH', 'Mass assignment / parameter pollution not tested',
+              'Write endpoint may bind unexpected fields (privilege/balance/state). '
+              '(Heuristic: no privilege keys (role/is_admin/verified/balance/etc.) observed in submitted body.)',
+              'body params: {0}'.format(list(p.body_params)[:8]),
+              'Add `role=admin`, `is_admin=true`, `verified=true`, `balance=999999`, `id=<other>` to the body. '
+              'Try JSON & form; duplicate keys (HPP); array/object wrapping `user[role]=admin`.',
+              'A08:2021 Software & Data Integrity Failures')
+        else:
+            credit()
 
     if 'api' in fn or 'graphql' not in fn:
         g('injection', 'LOW', 'Content-type / body-format confusion not tested',
@@ -944,79 +1307,129 @@ def _heuristics(p):
           'TRACE = XST; WebDAV verbs (PROPFIND/MKCOL).',
           'A05:2021 Security Misconfiguration', 'coverage')
 
-    g('header', 'MEDIUM', 'CORS / Origin trust not tested',
-      'Reflected or null Origin trust can expose authenticated data cross-site.',
-      'modified headers: {0}'.format(sorted(p.headers_modified) or "none"),
-      'Send `Origin: https://evil.com` and `Origin: null` -> check ACAO reflection + ACAC:true.',
-      'A05:2021 Security Misconfiguration')
+    if not _detect_cors_tested(p):
+        g('header', 'MEDIUM', 'CORS / Origin trust not tested',
+          'Reflected or null Origin trust can expose authenticated data cross-site. '
+          '(Heuristic: Origin header never modified across captured requests.)',
+          'modified headers: {0}'.format(sorted(p.headers_modified) or "none"),
+          'Send `Origin: https://evil.com` and `Origin: null` -> check ACAO reflection + ACAC:true.',
+          'A05:2021 Security Misconfiguration')
+    else:
+        credit()
 
-    if sens or state_changing:
+    if (sens or state_changing) and not _detect_header_spoofing_tested(p):
         never = set(['x-forwarded-for', 'x-forwarded-host', 'host', 'referer', 'origin']) - p.headers_modified
         g('header', 'MEDIUM', 'Header spoofing not tested: {0}'.format(", ".join(sorted(never)) or "none"),
-          'IP/host/origin trust headers never manipulated on a sensitive/write endpoint.',
+          'IP/host/origin trust headers never manipulated on a sensitive/write endpoint. '
+          '(Heuristic: no X-Forwarded-*, X-Real-IP, X-Original-URL, X-Rewrite-URL observed.)',
           'modified: {0}'.format(sorted(p.headers_modified) or "none"),
           'Test X-Forwarded-For: 127.0.0.1 (ACL bypass/rate-limit), X-Forwarded-Host/Host: evil '
           '(cache poisoning & password-reset link poisoning), X-Original-URL.',
           'A05:2021 Security Misconfiguration')
+    elif (sens or state_changing):
+        credit()
 
-    # A07: AUTH FAILURES
+    # A07: AUTH FAILURES - gate every gap on observed testing evidence so
+    # re-running CoverMap after a retest visibly reduces gap count.
+    auth_tested = _detect_auth_testing(p, all_params) if (fn & set(['auth', 'reset', 'register', 'otp'])) else set()
+
     if 'auth' in fn:
-        g('auth', 'HIGH', 'No brute-force / rate-limit / cred-stuffing test',
-          'Login endpoint - lockout, throttling and credential stuffing not exercised.',
-          'requests seen: {0}'.format(p.total_requests),
-          'Fire 50+ wrong passwords (check lockout), password-spray one pwd across users, '
-          'reuse breached creds, bypass lockout via X-Forwarded-For rotation & case/space user variants.',
-          'A07:2021 Identification & Authentication Failures')
-        g('auth', 'HIGH', 'Auth bypass payloads not tested',
-          'Login input not fuzzed for SQLi/NoSQL/LDAP auth bypass.',
-          'login form fields',
-          "Username `' OR '1'='1'-- -`, `admin'-- -`, NoSQL `{\"$ne\":null}`, LDAP `*)(uid=*`, "
-          "array-bind `user[]=a`. Also response/JWT-driven client trust bypass.",
-          'A07:2021 Identification & Authentication Failures')
-        g('auth', 'CRITICAL', 'Structural parameter tampering on login NOT tested',
-          'Param-removal / empty-value / null / type-confusion / array-bind cases on login fields - '
-          'classic auth-bypass primitives that injection-payload fuzzing misses.',
-          'params: {0}'.format(list(all_params)[:8]),
-          STRUCTURAL_LOGIN,
-          'A07:2021 Identification & Authentication Failures')
+        if 'brute_volume' not in auth_tested:
+            g('auth', 'HIGH', 'No brute-force / rate-limit / cred-stuffing test',
+              'Login endpoint - lockout, throttling and credential stuffing not exercised. '
+              '(Heuristic: <20 requests captured against this endpoint.)',
+              'requests seen: {0}'.format(p.total_requests),
+              'Fire 50+ wrong passwords (check lockout), password-spray one pwd across users, '
+              'reuse breached creds, bypass lockout via X-Forwarded-For rotation & case/space user variants.',
+              'A07:2021 Identification & Authentication Failures')
+        else:
+            credit()
+        if not (auth_tested & set(['sqli', 'nosql', 'ldap'])):
+            g('auth', 'HIGH', 'Auth bypass payloads not tested',
+              'Login input not fuzzed for SQLi/NoSQL/LDAP auth bypass. '
+              '(Heuristic: no auth-bypass signatures observed in username/password/email/uid values.)',
+              'login form fields',
+              "Username `' OR '1'='1'-- -`, `admin'-- -`, NoSQL `{\"$ne\":null}`, LDAP `*)(uid=*`, "
+              "array-bind `user[]=a`. Also response/JWT-driven client trust bypass.",
+              'A07:2021 Identification & Authentication Failures')
+        else:
+            credit()
+        if not (auth_tested & set(['empty', 'null', 'bool', 'typeconfusion', 'removed'])):
+            g('auth', 'CRITICAL', 'Structural parameter tampering on login NOT tested',
+              'Param-removal / empty-value / null / type-confusion / array-bind cases on login fields - '
+              'classic auth-bypass primitives that injection-payload fuzzing misses. '
+              '(Heuristic: no field-removal, empty, null, bool or array/duplicate-key observed on login fields.)',
+              'params: {0}'.format(list(all_params)[:8]),
+              STRUCTURAL_LOGIN,
+              'A07:2021 Identification & Authentication Failures')
+        else:
+            credit()
+
     if 'reset' in fn:
-        g('auth', 'CRITICAL', 'Password-reset weaknesses not tested',
-          'Reset flow - token strength, host-header poisoning, and user-enum not proven.',
-          'params: {0}'.format(list(all_params)[:6]),
-          'Check token entropy/expiry/single-use; Host/X-Forwarded-Host poisoning to steal reset link; '
-          'user-enumeration via response/timing; reset for victim then read token; param pollution on email.',
-          'A07:2021 Identification & Authentication Failures')
-        g('auth', 'CRITICAL', 'Structural parameter tampering on reset NOT tested',
-          'Removing or emptying token/email/code may let the reset proceed without proof of identity.',
-          'params: {0}'.format(list(all_params)[:8]),
-          STRUCTURAL_RESET,
-          'A07:2021 Identification & Authentication Failures')
+        if not (auth_tested & set(['field_fuzzed', 'brute_volume'])):
+            g('auth', 'CRITICAL', 'Password-reset weaknesses not tested',
+              'Reset flow - token strength, host-header poisoning, and user-enum not proven. '
+              '(Heuristic: <20 reqs and no per-field fuzzing of token/email observed.)',
+              'params: {0}'.format(list(all_params)[:6]),
+              'Check token entropy/expiry/single-use; Host/X-Forwarded-Host poisoning to steal reset link; '
+              'user-enumeration via response/timing; reset for victim then read token; param pollution on email.',
+              'A07:2021 Identification & Authentication Failures')
+        else:
+            credit()
+        if not (auth_tested & set(['empty', 'null', 'typeconfusion', 'removed'])):
+            g('auth', 'CRITICAL', 'Structural parameter tampering on reset NOT tested',
+              'Removing or emptying token/email/code may let the reset proceed without proof of identity. '
+              '(Heuristic: no field-removal, empty, null or array value observed in reset fields.)',
+              'params: {0}'.format(list(all_params)[:8]),
+              STRUCTURAL_RESET,
+              'A07:2021 Identification & Authentication Failures')
+        else:
+            credit()
+
     if 'register' in fn:
-        g('auth', 'HIGH', 'Registration abuse not tested',
-          'Signup - role mass-assignment, email-verification bypass, duplicate/overwrite not tested.',
-          'params: {0}'.format(list(all_params)[:8]),
-          'Inject role/is_admin during signup; register existing email (account takeover/overwrite); '
-          'skip email verification; homoglyph/`+`/dot email tricks; mass-create (no captcha/rate-limit).',
-          'A01:2021 Broken Access Control')
-        g('auth', 'HIGH', 'Structural parameter tampering on registration NOT tested',
-          'Empty / missing / array-bound fields plus injected privilege keys give privilege escalation '
-          'at signup time on backends that bind blindly.',
-          'params: {0}'.format(list(all_params)[:8]),
-          STRUCTURAL_REGISTER,
-          'A08:2021 Software & Data Integrity Failures')
+        priv_keys_injected = _detect_mass_assign_tested(p)
+        if not priv_keys_injected:
+            g('auth', 'HIGH', 'Registration abuse not tested',
+              'Signup - role mass-assignment, email-verification bypass, duplicate/overwrite not tested. '
+              '(Heuristic: no privilege keys (role/is_admin/verified/etc.) observed in submitted body.)',
+              'params: {0}'.format(list(all_params)[:8]),
+              'Inject role/is_admin during signup; register existing email (account takeover/overwrite); '
+              'skip email verification; homoglyph/`+`/dot email tricks; mass-create (no captcha/rate-limit).',
+              'A01:2021 Broken Access Control')
+        else:
+            credit()
+        if not (auth_tested & set(['empty', 'null', 'typeconfusion', 'removed'])) and not priv_keys_injected:
+            g('auth', 'HIGH', 'Structural parameter tampering on registration NOT tested',
+              'Empty / missing / array-bound fields plus injected privilege keys give privilege escalation '
+              'at signup time on backends that bind blindly. '
+              '(Heuristic: no field-removal, empty, null, array value or privilege keys observed.)',
+              'params: {0}'.format(list(all_params)[:8]),
+              STRUCTURAL_REGISTER,
+              'A08:2021 Software & Data Integrity Failures')
+        else:
+            credit()
+
     if 'otp' in fn:
-        g('auth', 'CRITICAL', 'OTP/2FA bypass not tested',
-          'Verification endpoint - brute-force, reuse, and response-tamper not exercised.',
-          'path={0}'.format(p.path),
-          'Brute 000000-999999 (no rate-limit?); reuse/expired code; response-tamper success flag; '
-          'remove 2fa param; race; backup-code abuse; null/`true` value.',
-          'A07:2021 Identification & Authentication Failures')
-        g('auth', 'CRITICAL', 'Structural parameter tampering on OTP NOT tested',
-          'Removing/blanking/null-typing the code param is one of the most common 2FA-bypass primitives. '
-          'Replay and race round it out.',
-          'params: {0}'.format(list(all_params)[:6]),
-          STRUCTURAL_OTP,
-          'A07:2021 Identification & Authentication Failures')
+        if not (auth_tested & set(['brute_volume', 'field_fuzzed'])):
+            g('auth', 'CRITICAL', 'OTP/2FA bypass not tested',
+              'Verification endpoint - brute-force, reuse, and response-tamper not exercised. '
+              '(Heuristic: <20 reqs and no per-field fuzzing of the code observed.)',
+              'path={0}'.format(p.path),
+              'Brute 000000-999999 (no rate-limit?); reuse/expired code; response-tamper success flag; '
+              'remove 2fa param; race; backup-code abuse; null/`true` value.',
+              'A07:2021 Identification & Authentication Failures')
+        else:
+            credit()
+        if not (auth_tested & set(['empty', 'null', 'bool', 'typeconfusion', 'removed'])):
+            g('auth', 'CRITICAL', 'Structural parameter tampering on OTP NOT tested',
+              'Removing/blanking/null-typing the code param is one of the most common 2FA-bypass primitives. '
+              'Replay and race round it out. '
+              '(Heuristic: no field-removal, empty, null, bool or array value observed in OTP fields.)',
+              'params: {0}'.format(list(all_params)[:6]),
+              STRUCTURAL_OTP,
+              'A07:2021 Identification & Authentication Failures')
+        else:
+            credit()
     if 'logout' in fn:
         g('logic', 'MEDIUM', 'Session lifecycle / logout CSRF not tested',
           'Logout - server-side invalidation and CSRF not proven.',
@@ -1130,10 +1543,21 @@ def _heuristics(p):
           '{0} requests, no variation'.format(p.total_requests),
           'Explicitly test in Repeater with targeted param manipulation.', '', 'coverage')
 
-    return gaps
+    return gaps, credits[0]
 
 
-def _score(p, gaps):
+def _score(p, gaps, credits=0):
+    """Coverage score 0-100.
+
+    Two components:
+      * Behaviour + real coverage gaps  -> fixed penalties (as before).
+      * Test surface                    -> RATIO based. The test penalty
+        scales with how much of the attack surface is still untested:
+        remaining_ratio = test_gaps / (test_gaps + credits). As the
+        pentester exercises more classes on a retest, `credits` rises and
+        `test_gaps` falls, so the penalty shrinks and the score climbs.
+        This is what makes re-running the tool after a retest move the
+        score, instead of saturating at a flat cap."""
     score = 100
     behavior_pen = {'single': 60, 'browse': 30, 'repeater': 0, 'intruder': 5}.get(p.behavior_class, 20)
     score -= behavior_pen
@@ -1141,8 +1565,12 @@ def _score(p, gaps):
     for gp in gaps:
         if gp.kind == 'coverage' and gp.category != 'behavior':
             score -= weight.get(gp.severity, 3)
-    test_pen = sum(weight.get(gp.severity, 3) for gp in gaps if gp.kind == 'test')
-    score -= min(test_pen, 25)
+    # Ratio-based test-surface penalty (worth up to 50 points).
+    test_gaps = sum(1 for gp in gaps if gp.kind == 'test')
+    surface = test_gaps + credits
+    if surface > 0:
+        remaining_ratio = float(test_gaps) / surface
+        score -= int(round(50 * remaining_ratio))
     if score < 0:
         score = 0
     if score > 100:
@@ -1160,15 +1588,15 @@ def analyse(profiles):
 
     sorted_profiles = sorted(profiles.values(), key=sort_key)
     for p in sorted_profiles:
-        gaps = _heuristics(p)
-        score = _score(p, gaps)
+        gaps, credits = _heuristics(p)
+        score = _score(p, gaps, credits)
         query_params_out = {}
         for k, v in p.query_params.items():
             query_params_out[k] = list(v)
         body_params_out = {}
         for k, v in p.body_params.items():
             body_params_out[k] = list(v)
-        audits.append(EndpointAudit(
+        audit = EndpointAudit(
             endpoint_id=p.endpoint_id, host=p.host, path=p.path,
             behavior_class=p.behavior_class, total_requests=p.total_requests,
             coverage_score=score,
@@ -1183,7 +1611,9 @@ def analyse(profiles):
                                    'max': max(p.response_lengths) if p.response_lengths else 0},
             sample_requests=p.sample_requests,
             gaps=gaps,
-        ))
+        )
+        audit.tests_credited = credits   # test classes proven exercised (climbs on retest)
+        audits.append(audit)
     audits.sort(key=lambda a: a.coverage_score)
     return audits
 
@@ -1308,6 +1738,8 @@ def to_json(audits):
             "endpoint_id": a.endpoint_id, "host": a.host, "path": a.path,
             "behavior_class": a.behavior_class, "total_requests": a.total_requests,
             "coverage_score": a.coverage_score, "coverage_label": score_label(a.coverage_score),
+            "tests_credited": getattr(a, 'tests_credited', 0),
+            "test_gaps_remaining": sum(1 for gp in a.gaps if gp.kind == 'test'),
             "methods_seen": a.methods_seen, "query_params": a.query_params,
             "body_params": a.body_params, "auth_coverage": a.auth_coverage,
             "status_codes": a.status_codes, "response_length_range": a.response_length_range,
@@ -1370,6 +1802,8 @@ def to_html(audits, engagement):
 
         sc = a.coverage_score
         score_cls = 's-bad' if sc < 40 else ('s-mid' if sc < 70 else 's-ok')
+        credited = getattr(a, 'tests_credited', 0)
+        test_gaps_n = sum(1 for gp in a.gaps if gp.kind == 'test')
         cards.append(
             '\n  <div class="ep">\n'
             '    <h2>EP{0} &mdash; {1}</h2>\n'
@@ -1379,6 +1813,7 @@ def to_html(audits, engagement):
             '      <span>Requests: <b>{6}</b></span>\n'
             '      <span>Methods: <b>{7}</b></span>\n'
             '      <span>Auth: <b>{8}</b> auth / <b>{9}</b> unauth</span>\n'
+            '      <span>Tests proven: <b>{12}</b> / {13} remaining</span>\n'
             '    </div>\n'
             '    <pre class="mermaid">\n{10}\n    </pre>\n'
             '    <div class="missed"><h3>Gaps / Missed Test Cases</h3>{11}</div>\n'
@@ -1387,7 +1822,7 @@ def to_html(audits, engagement):
                 _html_escape(a.behavior_class.upper()), a.total_requests,
                 _html_escape(", ".join(a.methods_seen)),
                 a.auth_coverage['with_auth'], a.auth_coverage['without_auth'],
-                mermaid_src, gaps_html))
+                mermaid_src, gaps_html, credited, test_gaps_n))
 
     css = (
         ":root { --bg:#0f1419; --card:#1b232d; --line:#2c3a47; --txt:#e6edf3; --muted:#9bb0c0;"
